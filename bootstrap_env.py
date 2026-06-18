@@ -128,9 +128,7 @@ def setup_environment(name: str, *, recreate: bool = False) -> bool:
 
     if exists:
         print("  Environment exists — updating ...")
-        ok, _ = run(
-            ["conda", "env", "update", "-f", ENV_FILE, "--prune"], stream=True
-        )
+        ok, _ = run(["conda", "env", "update", "-f", ENV_FILE, "--prune"], stream=True)
     else:
         print("  Creating environment ...")
         ok, _ = run(["conda", "env", "create", "-f", ENV_FILE], stream=True)

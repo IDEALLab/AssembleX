@@ -1,0 +1,6 @@
+[submodule "ATA"]
+	path = ATA
+	url = https://github.com/FaustinVonArx/Assemble-Them-All-Eval.git
+[submodule "ASAPx"]
+	path = ASAPx
+	url = https://github.com/FaustinVonArx/ASAPx.git

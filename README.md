@@ -1,151 +1,304 @@
-# Python Ruff Conda Template
+# AssembleX
 
-ETHZ IDEAL Lab Python project template with Ruff linting/formatting, MyPy type checking, and pre-commit hooks.
+AssembleX plans physically feasible disassembly sequences for multi-part
+product assemblies and generates the matching human-readable assembly manuals.
 
-## Quick Setup
+Given the part meshes (OBJ files) of one assembly, it does three things:
 
-### Prerequisites
-- [Miniforge](https://github.com/conda-forge/miniforge) (conda package manager)
-- [VS Code](https://code.visualstudio.com/) with recommended extensions (prompted on first open)
+1. **Disassembly sequence planning.** It computes an order in which the parts
+   can be removed, checking each step for collisions, gravity stability, the
+   number of parts that must be held, and optionally robot-arm reachability.
+2. **Rendering.** It produces a per-step disassembly GIF and the per-frame
+   motion path for each removed part.
+3. **Manual generation.** It writes per-step instructions, tool decisions,
+   manual pages, and failure feedback using LLM and VLM models.
 
-### Setup (all platforms)
+The tool exists to benchmark and compare planning strategies (random, geometric
+heuristics, a learned graph neural network, and LLM-guided search) and to
+measure the cost of the resulting plans, for example the estimated robot-arm
+assembly time. Planning runs on the RedMax physics simulator through a fork of
+the [ASAP](https://github.com/yunshengtian/ASAP) sequence planner.
 
-From the project root, run:
-```bash
-python bootstrap_env.py
+> **Platform.** RedMax is a C++ simulator that builds on Linux only. On Windows,
+> use [WSL](https://learn.microsoft.com/windows/wsl/install).
+
+## Table of Contents
+
+- [Architecture](#architecture)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Configuration](#configuration)
+- [Project Structure](#project-structure)
+- [Examples](#examples)
+- [Contributing](#contributing)
+- [License](#license)
+- [Credits and Acknowledgments](#credits-and-acknowledgments)
+- [Contact](#contact)
+
+## Architecture
+
+```
+raw OBJ files
+   │
+   ▼
+core/preprocess.py ──► normalised assembly ──► Assembly / Eval  (core/assembly.py)
+                                            │
+                                            ▼
+                              SequencePlanner  (core/sequence_planner.py)
+                              ├── ASAPx backend  (active, RedMax physics)
+                              └── ATA backend    (legacy)
+                                            │
+                                  tree.pkl + stats.json
+                                            │
+                                            ▼
+                  renderer ──────────► GIFs and per-step motion paths
+                  Feedback ──────────► manuals, instructions, failure feedback
+                  ToolAnalyzer ──────► tool decisions and poses
 ```
 
-This single script works on **Windows, macOS, and Linux**. It will:
-1. Create the conda environment from `environment.yml`
-2. Install dev tools (Ruff, MyPy, pytest, pre-commit)
-3. Install pre-commit git hooks
-4. Verify everything works
+ASAPx is the active backend. It evaluates every candidate step against gravity
+stability, tool feasibility, and grasp constraints, and it can score sequences
+to select a low-cost plan. The ATA backend is kept for one reason: its
+path planner is more general and is configured to find more complex disassembly
+paths than ASAPx. It reasons only about geometric assemblability, ignoring
+gravitational and tool failures, and it has no mechanism for optimality. ATA is
+therefore the better choice when theoretical assemblability is the only
+criterion of interest.
 
-> **Tip:** If your environment gets into a bad state, recreate it from scratch:
-> ```bash
-> python bootstrap_env.py --recreate
-> ```
+The planning graph (`tree.pkl`) and the run metadata (`stats.json`, holding the
+sequence, timings, and CLI arguments) are the interchange format between the
+planner and every downstream stage. A detailed map of the codebase, including
+the core classes, the two planner backends, and the generator, planner, and
+optimizer registries, lives in [CLAUDE.md](CLAUDE.md).
 
-### Manual Setup
+## Installation
 
-If you prefer to set things up step by step:
+The four numbered steps below are the supported install path. A convenience
+`setup.sh` runs steps 1 through 3 in one go.
+
+Before starting, make sure you have:
+
+- Linux, or Windows with WSL.
+- [Conda](https://docs.conda.io/) (Miniconda or Miniforge).
+- `cmake` and a C++ toolchain (`build-essential` or `g++`) to build RedMax.
+- An OpenAI API key, needed only for the LLM and VLM manual-generation steps.
+
+### 1. Clone the repository and fetch the planner backends
+
+The planner backends are git submodules. **ASAPx** is the active backend and is
+required. **ATA** is a legacy backend, only needed if you run with
+`--seq-planner ATA`, so installing it is optional.
+
+```bash
+git clone https://github.com/IDEALLab/AssembleX.git
+cd AssembleX
+# Required: the ASAPx backend (and its nested submodules)
+git submodule update --init --recursive ASAPx
+```
+
+To also install the optional ATA backend:
+
+```bash
+git submodule update --init --recursive ATA
+```
+
+### 2. Create the conda environment
 
 ```bash
 conda env create -f environment.yml
-conda activate <env-name>    # see environment.yml for the name
-pip install .[dev]
-pre-commit install
+conda activate assemblex
 ```
 
-### VS Code Configuration
+### 3. Build the RedMax physics binding (ASAPx backend)
 
-1. Open the project in VS Code — it will prompt you to install recommended extensions
-2. Copy `.vscode/settings_template.json` to `.vscode/settings.json`
+```bash
+cd ASAPx/simulation
+python setup.py install
+cd ../..
+```
+
+If `g++` fails, run `sudo apt update && sudo apt install build-essential` and
+retry. To confirm the simulator built correctly:
+
+```bash
+cd ASAPx && python test_sim/test_simple_sim.py --model box/box_stack --steps 2000 && cd ..
+```
+
+### 4. Provide your OpenAI API key
+
+Manual and instruction generation read the key from the `OPENAI_API_KEY`
+environment variable.
+
+```bash
+export OPENAI_API_KEY="sk-..."
+```
+
+> The optional `learn` generator needs extra PyTorch and PyTorch Geometric
+> dependencies; see the [ASAP repository](https://github.com/yunshengtian/ASAP).
 
 ## Usage
 
+All subcommands run through `main.py`, which dispatches on a `test_type`
+positional argument.
+
 ```bash
-conda activate <env-name>    # see environment.yml for the name
+python main.py <test_type> --id <assembly_id> [--dir <data_dir>] [options]
 ```
 
-### Code Quality
+`--id` accepts a single ID (`00042`) or an inclusive range (`00010-00050`).
+`--dir` is resolved under `assets/` and defaults to `data/multi_assembly`.
+
+Plan, render, and generate a manual for one assembly:
+
 ```bash
-ruff check .          # Lint
-ruff check --fix .    # Lint + auto-fix
-ruff format .         # Format
-mypy .                # Type-check
+python main.py test_pipeline --id 00000
 ```
 
-### Testing
+Run the full pipeline over a range, in parallel:
+
 ```bash
-pytest                # Run tests
+python main.py test_pipeline_batch --id 00000-00100
 ```
 
-### Pre-commit Hooks
+Re-render an already-planned assembly from its saved plan:
+
 ```bash
-pre-commit run --all-files   # Run all hooks manually
+python main.py test_render --id 00000 --storage-dir assets/output/<timestamp>/00000
 ```
 
-Hooks run automatically on every `git commit` — Ruff will lint, fix, and format your code before it enters the repository.
+For `test_pipeline`, the `-x` flag selects which stages run: `g` for gravity,
+`c` for collisions, `i` for instructions, `t` for tools, `f` for feedback,
+`m` for manuals, and `v` for the stitched video. All stages run by default;
+prefixing the string with `x` inverts the selection, running everything except
+the listed stages.
 
-## What's Included
+```bash
+python main.py test_pipeline --id 00000 -x gc    # only gravity and collisions
+python main.py test_pipeline --id 00000 -x xim   # everything except instructions and manuals
+```
 
-- **Python 3.11** via conda-forge
-- **Ruff** for fast linting and formatting (configured in `pyproject.toml`)
-- **MyPy** for static type checking
-- **pytest** for testing
-- **Pre-commit hooks** — Ruff lint/format + standard checks (trailing whitespace, YAML validation, merge conflicts, etc.)
-- **VS Code integration** with recommended extensions and settings template
+To choose a planner and generator:
+
+```bash
+python main.py test_pipeline --id 00000 --generator heur-out --planner dfs --max-grippers 2
+```
+
+The subcommands are grouped by purpose across three handler modules:
+
+| Group | Module | Subcommands |
+|---|---|---|
+| Pipeline | [run_pipeline.py](run_pipeline.py) | `test_pipeline`, `test_pipeline_batch`, `test_render` |
+| Data generation | [run_data.py](run_data.py) | `data_assembly_time`, `train_heuristic_weights`, `data_heuristic_validation`, `data_manual_validation`, `data_validate_cost`, `data_filter_assemblies`, `test_convex_decomp` |
+| Diagnostics | [run_debug.py](run_debug.py) | `test_divide_optimizer`, `test_param_sweep`, `test_collision`, `test_PCA`, `test_tools`, `test_tool_naming`, `test_gravity`, `test_collision_resolver`, `test_collision_graph_batch`, `test_archive_ASAP` |
+
+Run `python main.py --help` for the full list of subcommands and flags.
+
+Each assembly writes its outputs to a `storage_dir`, by default
+`assets/output/<timestamp>/<id>/`:
+
+```
+storage_dir/
+├── log/
+│   ├── tree.pkl        # planning graph
+│   ├── stats.json      # sequence, timings, divide split, CLI args
+│   └── ...
+├── paths/              # per-step motion (npy frames)
+├── 0_<part>.gif, …     # per-step disassembly GIFs
+└── ...                 # manuals, instructions, feedback
+```
+
+## Configuration
+
+`settings.py` is the single source of truth for runtime tuning. It holds the
+model selection (`LLM_model`, `VLM_model`), the global render on/off switch,
+planner behaviour, the heuristic and divide-optimizer weights, and the
+arm-pipeline parameters. Prefer editing it over adding flags when changing
+global behaviour.
+
+The OpenAI key is read from the `OPENAI_API_KEY` environment variable and is
+required for any step that calls an LLM or VLM. The `--token-limit` flag sets a
+cumulative token budget across all assemblies in a run; once the budget is
+exceeded, further LLM calls are skipped and the non-LLM stages still complete.
+For reproducibility, every run copies its `settings.py` and writes a
+`stats.json` summary into the output directory.
 
 ## Project Structure
 
 ```
-├── .vscode/
-│   ├── extensions.json          # Recommended VS Code extensions
-│   └── settings_template.json   # VS Code settings template
-├── src/                         # Source code
-│   ├── __init__.py
-│   └── example.py               # Example module (intentionally messy — try ruff on it)
-├── tests/                       # Tests
-│   ├── __init__.py
-│   └── test_example.py
-├── bootstrap_env.py             # Cross-platform setup script
-├── environment.yml              # Conda environment definition
-├── pyproject.toml               # Project config, Ruff & MyPy settings
-└── .pre-commit-config.yaml      # Pre-commit hook configuration
+AssembleX/
+├── main.py                 # CLI entry point and dispatcher
+├── run_pipeline.py         # pipeline subcommand handlers
+├── run_data.py             # data-generation subcommand handlers
+├── run_debug.py            # diagnostic subcommand handlers
+├── run_common.py           # shared CLI helpers (ID resolution, summaries)
+├── settings.py             # central configuration
+├── core/                   # importable package (domain logic)
+│   ├── assembly.py         # Eval / Assembly / Object core
+│   ├── models.py           # Object, Step
+│   ├── sequence_planner.py # SequencePlanner (wraps ASAPx / ATA)
+│   ├── simulation.py       # Simulation, ContactTree (collision, gravity)
+│   ├── feedback_generator.py  # LLM/VLM manual and instruction generation
+│   ├── manual_generator.py    # manual page rendering
+│   ├── manual_validator.py    # manual-fidelity validation
+│   ├── tool_analyzer.py    # per-part tool decisions and poses
+│   ├── renderer.py         # GIF stitching
+│   ├── collision_checker.py   # collision queries
+│   ├── perturbation.py     # geometric collision resolver
+│   ├── preprocess.py       # OBJ normalisation
+│   ├── separate_mesh.py    # split multi-part GLB/OBJ scenes into per-part .obj
+│   └── plot_comparison.py  # comparison-summary plotting
+├── ASAPx/                  # active planner backend (fork of ASAP) and RedMax sim
+├── ATA/                    # legacy planner backend (fork of Assemble-Them-All)
+├── assets/                 # data, tools, prompts, outputs, caches
+├── environment.yml         # conda environment (name: assemblex, python 3.11)
+└── CLAUDE.md               # detailed codebase map
 ```
 
-## Adding Dependencies
+## Examples
 
-**Conda packages** (compiled/scientific libraries like NumPy, SciPy, etc.):
+Sample assemblies ship under `assets/data/multi_assembly/<id>/`, each a folder
+of `.obj` part meshes, so the commands above run without extra setup. A catalog
+of tools (screwdrivers, wrenches, allen keys) lives under `assets/tools/` and
+feeds the tool-decision and tool-feasibility steps. Planning and rendering write
+per-step disassembly GIFs into each assembly's output directory, and the
+`data_assembly_time` benchmark additionally produces per-assembly and
+cross-assembly cost charts.
 
-Edit `environment.yml`:
-```yaml
-dependencies:
-  - python=3.11.8
-  - numpy        # add conda packages here
-  - pip
-```
+## Contributing
 
-**Python packages** (pure Python libraries, dev tools):
+Contributions are welcome through issues and pull requests. The code follows
+[ruff](https://docs.astral.sh/ruff/) with `line-length = 120` and the `E`, `F`,
+and `I` rule sets (see `pyproject.toml`); run `ruff check .` before submitting,
+and keep emojis and decorative formatting out of code and markdown. Branch off
+`main`, keep changes focused, and open a pull request with a clear description.
+Read [CLAUDE.md](CLAUDE.md) first: it documents the conventions that are easy to
+trip over, such as the ASAPx/ATA module-eviction rule and the use of `tree.pkl`
+and `stats.json` as the interchange format.
 
-Edit `pyproject.toml`:
-```toml
-[project.optional-dependencies]
-dev = [
-  "mypy",
-  "pytest",
-  "ruff",
-  "pre-commit",
-  "some-new-tool",   # add dev-only packages here
-]
-```
+## License
 
-Then update your environment:
-```bash
-conda env update -f environment.yml --prune
-pip install .[dev]
-```
+This project is released under the [MIT License](LICENSE). The bundled `ASAPx/`
+and `ATA/` backends derive from prior work (see below) and carry their own
+upstream licenses, which the MIT license here does not override.
 
-## Troubleshooting
+## Credits and Acknowledgments
 
-| Problem | Solution |
-|---------|----------|
-| Ruff not found in VS Code | Restart VS Code after activating the conda environment |
-| Pre-commit not working | Run `pre-commit install` inside the activated environment |
-| Environment issues | `python bootstrap_env.py --recreate` |
-| Wrong Python interpreter in VS Code | Open Command Palette → "Python: Select Interpreter" → pick the conda env |
+This project builds directly on two works by Yunsheng Tian and collaborators.
+The ASAPx backend is a fork of
+[ASAP](https://github.com/yunshengtian/ASAP) (Tian et al., *Automated Sequence
+Planning for Complex Robotic Assembly with Physical Feasibility*, ICRA 2024).
+The ATA backend is a fork of
+[Assemble-Them-All](https://github.com/yunshengtian/Assemble-Them-All) (Tian et
+al., *Assemble Them All: Physics-Based Planning for Generalizable Assembly by
+Disassembly*, SIGGRAPH Asia 2022). Both rely on the [RedMax](https://github.com/sueda/redmax) (REDMAX: Efficient & Flexible Approach for Articulated Dynamics, Wang et al., SIGGRAPH 2019) differentiable
+rigid-body simulator for the feasibility and stability checks, and the manual
+and instruction generation uses the OpenAI API.
 
-## Starting a New Project
+I developed this work in the [IDEAL Lab](https://ideal.ethz.ch) at ETH Zürich.
 
-1. Click **"Use this template"** on the [GitHub repository page](https://github.com/IDEALLab/python-ruff-conda-template) to create your own repo
-2. Clone your new repository and run `python bootstrap_env.py`
-3. Replace all placeholder names with your project's details:
+## Contact
 
-| File | What to change |
-|------|----------------|
-| `pyproject.toml` | `name`, `description`, `authors` |
-| `environment.yml` | `name` (this becomes your `conda activate` name) |
-| `src/__init__.py` | Package docstring |
-| `tests/__init__.py` | Package docstring |
-| `README.md` | Title, description |
+Maintained by Faustin von Arx ([@FaustinVonArx](https://github.com/FaustinVonArx)).
+Reach me at fvonarx@ethz.ch, or open a
+[GitHub issue](https://github.com/IDEALLab/AssembleX/issues) for
+questions and bugs.

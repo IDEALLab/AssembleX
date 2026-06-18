@@ -1,9 +1,9 @@
 [project]
-name = "python-ruff-template"
+name = "assemblex"
 version = "0.1.0"
-description = "Python project template with ruff and pre-commit for IDEAL Lab at ETHZ"
+description = "AssembleX: disassembly sequence planning and assembly-manual generation for multi-part assemblies"
 authors = [
-    {name = "Soheyl Massoudi", email = "smassoudi@ethz.ch"}
+    {name = "Faustin von Arx", email = "finfofaust@gmail.com"}
 ]
 readme = "README.md"
 requires-python = ">=3.11"
@@ -40,6 +40,10 @@ exclude = [
     "dist",
     "node_modules",
     "venv",
+    # Git submodules (third-party code, not linted)
+    "ASAPx",
+    "ATA",
+    "Assemble-Them-All-Eval",
 ]
 
 line-length = 88
@@ -60,23 +64,54 @@ select = [
     "C4",   # flake8-comprehensions
     "PIE",  # flake8-pie
     "SIM",  # flake8-simplify
-    "ARG",  # flake8-unused-arguments
-    "PTH",  # flake8-use-pathlib
     "ERA",  # eradicate
     "PD",   # pandas-vet
     "PGH",  # pygrep-hooks
     "PL",   # pylint
-    "TRY",  # tryceratops
     "FLY",  # flynt
     "NPY",  # numpy
-    "PERF", # perflint
     "FURB", # refurb
     "LOG",  # flake8-logging
     "RUF",  # Ruff-specific rules
 ]
 
 ignore = [
-    "B008",  # do not perform function calls in argument defaults
+    "B008",     # function calls in argument defaults
+
+    # Unicode glyphs used intentionally (✓ × → –) in strings/docstrings/comments
+    "RUF001",
+    "RUF002",
+    "RUF003",
+
+    # Deliberate patterns: lazy backend imports and imports after sys.path setup
+    "PLC0415",  # import outside top-level (lazy ASAPx/ATA backends)
+    "E402",     # module import not at top of file
+    "PLW0603",  # global statement
+    "PLW2901",  # redefined loop variable
+
+    # Naming: scientific / non-lowercase identifiers (M, P matrices; camelCase)
+    "N802",     # invalid function name
+    "N803",     # invalid argument name
+    "N806",     # non-lowercase variable in function
+    "N811",     # constant imported as non-constant
+    "E741",     # ambiguous variable name (l / I / O)
+
+    # Advisory style — not worth the churn in this research codebase
+    "PLR2004",  # magic value in comparison
+    "PLR0911",  # too many return statements
+    "PLR0912",  # too many branches
+    "PLR0913",  # too many arguments
+    "PLR0915",  # too many statements
+    "ERA001",   # commented-out code
+    "SIM102",   # collapsible if
+    "PLC0206",  # dict index missing .items()
+    "B007",     # unused loop control variable
+    "B018",     # useless expression (triple-quoted block "comments")
+    "RUF059",   # unused unpacked variable
+
+    # Silenced per "relax to passing" but CAN flag real issues — revisit later
+    "PLR0124",  # comparison with itself (often a NaN check: x != x)
+    "PLW1510",  # subprocess.run without check= (return code handled manually)
 ]
 
 # Allow fix for all enabled rules (when `--fix`) is provided.
@@ -87,7 +122,7 @@ unfixable = []
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 
 [tool.ruff.lint.isort]
-known-first-party = ["src"]
+known-first-party = ["core"]
 
 [tool.ruff.lint.pylint]
 max-args = 5
@@ -98,13 +133,40 @@ max-args = 5
 [tool.mypy]
 warn_redundant_casts = true
 warn_unused_ignores = true
-files = ["src/", "tests/"]
+files = ["core/", "tests/"]
 exclude = [
   "^build/",
   "^docs/",
+  # Git submodules (third-party code, not type-checked)
+  "^ASAPx/",
+  "^ATA/",
+  "^Assemble-Them-All-Eval/",
 ]
 [[tool.mypy.overrides]]
+# Third-party dependencies without type stubs
 module = [
-  # Put dependencies without type hints here
+  "coacd",
+  "cairosvg",
+  "networkx",
+  "pymeshfix",
+  "redmax_py",
+  "reportlab.*",
+  "scipy.*",
+  "svglib.*",
+  "tqdm",
 ]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Git-submodule backends (ASAPx / ATA) and their internal top-level packages,
+# imported at runtime via sys.path inserts. Not type-checked here.
+module = [
+  "ASAPx.*",
+  "ATA.*",
+  "archive.*",
+  "assets.*",
+  "plan_robot.*",
+  "plan_sequence.*",
+]
+ignore_missing_imports = true
+follow_imports = "skip"

@@ -1,6 +1,69 @@
-name: python-ruff-template
+name: assemblex
 channels:
   - conda-forge
+  - defaults
 dependencies:
-  - python=3.11.8
+  - python=3.11
   - pip
+  - setuptools
+  - wheel
+  - cmake
+  # Heavy Math and C++ (managed by conda for binary compatibility)
+  - numpy <2.0.0
+  - scipy
+  - scikit-learn
+  - scikit-image
+  - matplotlib
+  - networkx
+  - pygraphviz
+  - rtree
+  # to be categorized
+  - opencv
+  - pip:
+    # Collision detection
+    - python-fcl==0.7.0.10
+    # CAD, Math and System Tools
+    - trimesh
+    - pyquaternion
+    - pillow
+    - tqdm
+    - requests
+    - pyparsing
+    - python-dateutil
+    - pyglet
+    - six
+    - sortedcontainers
+    - cloudpickle
+    - ffmpeg-python
+    - ikpy
+    # IPython / CLI ecosystem
+    - ipython
+    - prompt-toolkit
+    - pygments
+    - traitlets
+    - decorator
+    - jedi
+    - parso
+    - pexpect
+    - ptyprocess
+    - pickleshare
+    - matplotlib-inline
+    - backcall
+    - typing-extensions
+    - wcwidth
+    - importlib-metadata
+    - packaging
+    - fonttools
+    - cycler
+    - kiwisolver
+    - zipp
+    # Plotting
+    - seaborn
+    # Note: the optional `learn` generator additionally needs PyTorch +
+    # PyTorch Geometric; see the ASAP repo (https://github.com/yunshengtian/ASAP).
+    # Wrapper dependencies
+    - openai
+    - python-dotenv
+    - pyvista
+    - manifold3d
+    - distinctipy

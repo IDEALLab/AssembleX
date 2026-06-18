@@ -1,0 +1,1333 @@
+import json
+
+import numpy as np
+import pyvista as pv
+import trimesh
+from openai import OpenAI
+
+import settings
+from core.feedback_generator import convert_angle_pv_pos
+from core.models import AnnotationDecision
+
+# Token estimate for one client.images.edit call (gpt-image-1 @ 1024x1024).
+# images.edit doesn't report usage, so this is added manually after each call.
+# Breakdown: ~150 prompt + ~1100/input image + ~1100-4160 output image.
+_IMAGE_EDIT_TOKEN_ESTIMATE = 4000
+
+
+_SYSTEM_ANNOTATION = (
+    "You are an assembly-manual annotation designer. The page geometry (part outlines and "
+    "assembly arrow) is already drawn correctly from projected mesh data — DO NOT try to alter "
+    "geometry. You decide ONLY annotation metadata for one step:\n"
+    "  - label_text: a short human-readable name for the moving part\n"
+    "  - callout_position: where to place the label, avoiding the moving-part centroid by ~50 px "
+    "and staying inside the canvas with at least 40 px margin\n"
+    "  - show_tool_icon / tool_icon_position: include only if a tool is required\n"
+    "  - add_zoom_inset: true only when the part is small or has fine-detail features that benefit "
+    "from magnification\n"
+    "  - step_note: one short instruction line if it adds value (null otherwise)\n"
+    "Respect the provided canvas size. Coordinates are in pixels with origin at top-left."
+)
+
+
+class ManualGenerator:
+    """Visual manual page generation (image_edit / wireframe / annotated / offline / iterative).
+
+    Shared state (`assembly.instructions`, `_make_messages`, `_to_canonical`) lives on
+    the parent Assembly. Step-instruction text reuse goes through a FeedbackGenerator
+    reference passed at init time.
+    """
+
+    def __init__(self, assembly, feedback):
+        self.assembly = assembly
+        self.feedback = feedback
+
+    def _present_ids(self, step_idx):
+        """Return the set of part IDs present in the assembly for assembly step step_idx.
+
+        Assembly order is the reverse of the disassembly sequence: step 0 of the
+        assembly manual corresponds to the LAST disassembly step (fewest parts
+        already installed).  The parts visible at this step are the current part
+        plus all parts removed LATER in disassembly (already installed before
+        this step in assembly), plus assembly.remaining (never disassembled).
+        """
+        seq = self.assembly.sequence
+        present = {seq[i].obj_id for i in range(step_idx, len(seq))}
+        present |= {s.obj_id for s in self.assembly.remaining}
+        return present
+
+    @staticmethod
+    def _best_angle(step, skip=()):
+        """Return the best-ranked angle from step.images that is not in `skip`.
+
+        After Step.rank_angles() the dict is ordered best→worst by SSIM, so
+        this returns the BEST non-skipped angle — i.e. the second-best when
+        iso2 happens to rank first.
+
+        Frame availability is INTENTIONALLY ignored: this picks a camera
+        DIRECTION (a string label), and downstream consumers that need actual
+        frames handle empty slots with their own fallback.
+        """
+        images = step.images or {}
+        for angle in images:
+            if angle not in skip:
+                return angle
+        for angle, frames in images.items():
+            if frames:
+                return angle
+        return "iso1"
+
+    # ------------------------------------------------------------------
+    # image_edit backend (full color render -> VLM polish)
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Wireframe backend (HLR render -> VLM polish)
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Annotated backend (raw render + corner panel + VLM polish pass)
+    # ------------------------------------------------------------------
+    def _render_base_composite_to_file(
+        self,
+        step,
+        save_path,
+        size=(1024, 768),
+        present_ids=None,
+        camera_angle=None,
+        include_motion=True,
+    ):
+        """Solid-surface composite rendered in the simulation's pose frame for
+        this step (step.pose applied to every part).  Moving part in BLUE at
+        its assembled position, the SAME moving part in RED at its disassembled
+        position (transformed by step.matrices[-1], which is already in pose
+        frame), and every other present part in lightgray.
+
+        present_ids: if given, only parts whose id is in this set are rendered.
+        camera_angle: explicit angle key (e.g. "iso1") to override per-step
+            ranking; use this to keep a consistent viewing direction across steps.
+        include_motion: if False, the red disassembled-position ghost AND the
+            purple intermediate-trail dots are skipped — only the blue assembled
+            position is drawn.  Used by the validator's ablation studies to
+            measure the contribution of the assembly-process visualisation."""
+        plotter = pv.Plotter(off_screen=True, window_size=size)
+        plotter.set_background("white")
+        angle = (
+            camera_angle
+            if camera_angle is not None
+            else (self._best_angle(step) if step.images else "iso1")
+        )
+
+        pose = (
+            np.asarray(step.pose, dtype=float) if step.pose is not None else np.eye(4)
+        )
+
+        for obj in self.assembly.objects.values():
+            if obj.id == step.obj_id:
+                continue
+            if present_ids is not None and obj.id not in present_ids:
+                continue
+            mesh = obj.tri_mesh.copy().apply_transform(pose)
+            plotter.add_mesh(mesh, color="lightgray", opacity=1.0)
+
+        moving = self.assembly.objects[step.obj_id]
+        blue_mesh = moving.tri_mesh.copy().apply_transform(pose)
+        plotter.add_mesh(blue_mesh, color="blue", opacity=1.0)
+
+        matrices = step.matrices if step.matrices is not None else []
+        if include_motion:
+            # Optional path trail: small purple dots at the part's centre of mass
+            # for each intermediate frame between assembled (blue) and disassembled
+            # (red).  Frame indices 1..len-2 are sampled (endpoints excluded).
+            if (
+                getattr(settings, "manual_show_path_trail", False)
+                and len(matrices) >= 3
+            ):
+                max_ghosts = int(getattr(settings, "manual_path_trail_max", 5))
+                inner = list(range(1, len(matrices) - 1))
+                if max_ghosts > 0 and len(inner) > max_ghosts:
+                    idxs = (
+                        np.linspace(0, len(inner) - 1, max_ghosts).round().astype(int)
+                    )
+                    inner = [inner[i] for i in idxs]
+                com_local = np.asarray(moving.tri_mesh.center_mass, dtype=float)
+                com_h = np.append(com_local, 1.0)
+                ext = np.asarray(moving.tri_mesh.extents, dtype=float)
+                dot_radius = 0.04 * float(np.linalg.norm(ext))
+                for idx in inner:
+                    T = np.asarray(matrices[idx], dtype=float)
+                    world = (T @ com_h)[:3]
+                    dot = pv.Sphere(radius=dot_radius, center=tuple(world.tolist()))
+                    plotter.add_mesh(dot, color="purple", opacity=1.0)
+
+            # step.matrices is already in pose frame, so apply it directly.
+            transform = matrices[-1] if len(matrices) else pose
+            red_mesh = moving.tri_mesh.copy().apply_transform(transform)
+            plotter.add_mesh(red_mesh, color="red", opacity=1.0)
+
+        cam = convert_angle_pv_pos(angle)
+        plotter.camera_position = cam
+        plotter.reset_camera()  # keeps direction, fits to present parts
+        plotter.screenshot(str(save_path))
+        plotter.close()
+
+    @staticmethod
+    def _load_fonts():
+        """Best-effort font lookup; falls back to PIL default."""
+        from PIL import ImageFont
+
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        ]
+        body_candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ]
+        title = body = big = None
+        for p in candidates:
+            try:
+                title = ImageFont.truetype(p, 16)
+                big = ImageFont.truetype(p, 22)
+                break
+            except OSError:
+                continue
+        for p in body_candidates:
+            try:
+                body = ImageFont.truetype(p, 14)
+                break
+            except OSError:
+                continue
+        if title is None:
+            title = ImageFont.load_default()
+        if body is None:
+            body = ImageFont.load_default()
+        if big is None:
+            big = title
+        return title, body, big
+
+    def _fetch_step_instruction(self, step, step_idx, step_dir, camera_angle=None):
+        """Reuse FeedbackGenerator.generate_instructions_from_paths to produce a
+        one-sentence instruction. Falls back to a simple template if the LLM
+        call fails or is skipped by the token budget.
+
+        camera_angle: forwarded so the LLM sees frames from the same camera
+            angle the manual page is being rendered with."""
+        instruction = None
+        try:
+            client = OpenAI(api_key=self.assembly.openai_api_key)
+            instruction = self.feedback.generate_instructions_from_paths(
+                step,
+                step_number=step_idx + 1,
+                client=client,
+                camera_angle=camera_angle,
+            )
+        except Exception as e:
+            print(f"  instruction generation failed: {e}")
+        if not instruction:
+            moving_name = self.assembly.objects[step.obj_id].name
+            instruction = f"Install {moving_name}."
+        (step_dir / "instruction.txt").write_text(instruction)
+        return instruction
+
+    def _draw_bottom_instruction_text(self, canvas, instruction, region, title=None):
+        """Draw word-wrapped instruction text in the bottom region (x1,y1,x2,y2).
+
+        If title is given, it is drawn as a bold centered header above the body text."""
+        from PIL import ImageDraw
+
+        x1, y1, x2, _y2 = region
+        draw = ImageDraw.Draw(canvas)
+        draw.line([(x1 + 20, y1), (x2 - 20, y1)], fill="black", width=2)
+
+        title_font, _, big_font = self._load_fonts()
+        cx = (x1 + x2) // 2
+        y = y1 + 10
+
+        if title:
+            tw = draw.textlength(title, font=title_font)
+            draw.text((cx - tw // 2, y), title, fill="black", font=title_font)
+            y += 30
+
+        max_width = (x2 - x1) - 40
+        words = (instruction or "").split()
+        lines = []
+        cur = ""
+        for w in words:
+            trial = (cur + " " + w).strip()
+            if draw.textlength(trial, font=big_font) <= max_width:
+                cur = trial
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+
+        line_h = 28
+        lines = lines[:5]
+        for line in lines:
+            w = draw.textlength(line, font=big_font)
+            draw.text((cx - w // 2, y), line, fill="black", font=big_font)
+            y += line_h
+
+    # ------------------------------------------------------------------
+    # Offline backend (same layout as annotated, no LLM/VLM calls)
+    # ------------------------------------------------------------------
+
+    def _render_isolated_mesh_solid_to_pil(
+        self, mesh, size=(240, 140), color="lightgray"
+    ):
+        """Solid-shaded isometric render (matches the main composite's style:
+        opaque colored surface, no wireframe overlay). Returns PIL RGBA."""
+        import os
+        import tempfile
+
+        from PIL import Image
+
+        plotter = pv.Plotter(off_screen=True, window_size=size)
+        plotter.set_background("white")
+        plotter.add_mesh(mesh, color=color, opacity=1.0)
+        plotter.camera_position = "iso"
+        plotter.reset_camera()
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_path = tmp.name
+        plotter.screenshot(tmp_path)
+        plotter.close()
+        img = Image.open(tmp_path).convert("RGBA")
+        os.unlink(tmp_path)
+        return img
+
+    def _render_rest_of_assembly_to_pil(
+        self,
+        step,
+        size=(240, 200),
+        color="lightgray",
+        present_ids=None,
+        pose_override=None,
+    ):
+        """Render every part of the assembly EXCEPT the currently-moving part,
+        using the same solid-surface styling as the main composite (no wireframe).
+        Returns a PIL RGBA image (transparent if no parts remain).
+
+        present_ids: if given, only parts whose id is in this set are rendered.
+        pose_override: if given, use this 4x4 matrix as the pose for every part
+            instead of step.pose (used by the rotation panel to show the previous
+            assembly step's pose — i.e., the orientation BEFORE the rotation)."""
+        import os
+        import tempfile
+
+        from PIL import Image
+
+        plotter = pv.Plotter(off_screen=True, window_size=size)
+        plotter.set_background("white")
+        if pose_override is not None:
+            pose = np.asarray(pose_override, dtype=float)
+        elif step.pose is not None:
+            pose = np.asarray(step.pose, dtype=float)
+        else:
+            pose = np.eye(4)
+        added = 0
+        for obj in self.assembly.objects.values():
+            if obj.id == step.obj_id:
+                continue
+            if present_ids is not None and obj.id not in present_ids:
+                continue
+            mesh = obj.tri_mesh.copy().apply_transform(pose)
+            plotter.add_mesh(mesh, color=color, opacity=1.0)
+            added += 1
+        if added == 0:
+            plotter.close()
+            return Image.new("RGBA", size, (255, 255, 255, 0))
+        plotter.camera_position = "iso"
+        plotter.reset_camera()
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_path = tmp.name
+        plotter.screenshot(tmp_path)
+        plotter.close()
+        img = Image.open(tmp_path).convert("RGBA")
+        os.unlink(tmp_path)
+        return img
+
+    def _draw_offline_rotation_panel(
+        self, step, panel_size=(280, 380), present_ids=None, prev_pose=None
+    ):
+        """Left corner panel: rotation widget over a wireframe render of the
+        already-installed parts (everything except the moving part), plus the
+        hold list. Caller guarantees step.rotated and step.pose.
+
+        prev_pose: if given, render the present parts in this pose (the previous
+            assembly step's pose) to show the orientation BEFORE the rotation."""
+        from PIL import Image, ImageDraw
+
+        panel = Image.new("RGBA", panel_size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(panel)
+        draw.rounded_rectangle(
+            [0, 0, panel_size[0] - 1, panel_size[1] - 1],
+            radius=24,
+            fill=(255, 255, 255, 240),
+            outline="black",
+            width=2,
+        )
+        title_font, body_font, _ = self._load_fonts()
+        from PIL import ImageFont
+
+        hold_font = body_font
+        for p in (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ):
+            try:
+                hold_font = ImageFont.truetype(p, 18)
+                break
+            except OSError:
+                continue
+
+        y = 12
+        icon_size = (panel_size[0] - 24, 200)
+
+        draw.text((12, y), "Reorientation from", fill="black", font=title_font)
+        y += 20
+        draw.text((12, y), "previous step:", fill="black", font=title_font)
+        y += 22
+        try:
+            rest_img = self._render_rest_of_assembly_to_pil(
+                step,
+                size=icon_size,
+                present_ids=present_ids,
+                pose_override=prev_pose,
+            )
+            panel.paste(rest_img, (12, y), rest_img)
+        except Exception as e:
+            print(f"  rest-of-assembly icon render failed: {e}")
+        y += icon_size[1] + 10
+
+        if step.parts_fix:
+            draw.text((12, y), "Hold:", fill="black", font=title_font)
+            y += 24
+            names = []
+            for pid in step.parts_fix:
+                obj = self.assembly.objects.get(str(pid)) or self.assembly.objects.get(
+                    pid
+                )
+                names.append(obj.name if obj else str(pid))
+            for name in names[:4]:
+                draw.text((22, y), f"• {name}", fill="black", font=hold_font)
+                y += 22
+            if len(names) > 4:
+                draw.text(
+                    (22, y), f"... +{len(names) - 4} more", fill="gray", font=hold_font
+                )
+        return panel
+
+    def _draw_offline_tool_panel(self, step, panel_size=(280, 380)):
+        """Right corner panel: tool icon rendered with the same solid-surface
+        styling as the main composite (no wireframe). Caller guarantees
+        step.tool is set."""
+        from PIL import Image, ImageDraw
+
+        panel = Image.new("RGBA", panel_size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(panel)
+        draw.rounded_rectangle(
+            [0, 0, panel_size[0] - 1, panel_size[1] - 1],
+            radius=24,
+            fill=(255, 255, 255, 240),
+            outline="black",
+            width=2,
+        )
+        title_font, body_font, _ = self._load_fonts()
+
+        y = 12
+        icon_size = (panel_size[0] - 24, 200)
+
+        draw.text((12, y), f"Tool: {step.tool}", fill="black", font=title_font)
+        y += 24
+        scaled = getattr(self.assembly, "scaled_tools", None) or {}
+        tool_obj = scaled.get(step.tool)
+        if tool_obj is not None and hasattr(tool_obj, "tri_mesh"):
+            try:
+                tool_img = self._render_isolated_mesh_solid_to_pil(
+                    tool_obj.tri_mesh, size=icon_size
+                )
+                panel.paste(tool_img, (12, y), tool_img)
+            except Exception as e:
+                print(f"  tool icon render failed: {e}")
+                draw.text((12, y), "(icon render failed)", fill="gray", font=body_font)
+        else:
+            draw.text((12, y), "(no mesh available)", fill="gray", font=body_font)
+        return panel
+
+    def _render_single_part_to_file(
+        self, step, save_path, size=(1024, 768), camera_angle=None
+    ):
+        """Render one part in lightgray with no blue/red position markers, in the
+        simulation's pose frame for this step.  Used for the initial-state
+        assembly page where there is nothing to install into."""
+        plotter = pv.Plotter(off_screen=True, window_size=size)
+        plotter.set_background("white")
+        angle = (
+            camera_angle
+            if camera_angle is not None
+            else (self._best_angle(step) if step.images else "iso1")
+        )
+        pose = (
+            np.asarray(step.pose, dtype=float) if step.pose is not None else np.eye(4)
+        )
+        mesh = self.assembly.objects[step.obj_id].tri_mesh.copy().apply_transform(pose)
+        plotter.add_mesh(mesh, color="lightgray", opacity=1.0)
+        cam = convert_angle_pv_pos(angle)
+        plotter.camera_position = cam
+        plotter.reset_camera()
+        plotter.screenshot(str(save_path))
+        plotter.close()
+
+    # Supported ablation flags for generate_manual_offline (used by the
+    # manual_validator's per-component evaluation).
+    ABLATIONS = ("full", "no_angle_ranking", "no_text", "no_motion")
+
+    def generate_manual_offline(self, step_idx, ablation="full"):
+        """Fully offline manual page: composite render + programmatic corner
+        panel + LLM instruction sentence.
+
+        When step_idx is the last disassembly step (first assembly step, only one
+        part present), a simplified initial-state page is rendered: a neutral
+        single-part view with a short fixed caption and no corner panels.
+
+        ablation: one of self.ABLATIONS.  Controls which features are disabled
+            in this rendering so the validator can measure their contribution:
+              "full"             — baseline; all features on.
+              "no_angle_ranking" — force camera_angle="iso1" instead of using
+                                   the SSIM-best angle for this step.
+              "no_text"          — bottom-region instruction text is blanked
+                                   (title is still shown so the page reads as
+                                   "Step N", just with no sentences).
+              "no_motion"        — base composite omits the red disassembled-
+                                   position ghost and the purple intermediate
+                                   path trail.
+            The output filename gets a per-ablation suffix so all four pages
+            coexist on disk under the same step folder.
+        """
+        if ablation not in self.ABLATIONS:
+            raise ValueError(
+                f"Unknown ablation '{ablation}'; expected one of {self.ABLATIONS}"
+            )
+        if self.assembly.evaluation and self.assembly.evaluation.verbose:
+            print(f"\nCreating offline manual (ablation={ablation})...")
+
+        from PIL import Image
+
+        step = self.assembly.sequence[step_idx]
+        save_dir = self.assembly.output_dir / "manual"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        step_dir = save_dir / f"step_{step_idx}_{step.obj_id}_offline"
+        step_dir.mkdir(parents=True, exist_ok=True)
+
+        # Ablation flags.
+        use_angle_ranking = ablation != "no_angle_ranking"
+        include_text = ablation != "no_text"
+        include_motion = ablation != "no_motion"
+
+        if use_angle_ranking:
+            camera_angle = self._best_angle(step) if step.images else "iso1"
+        else:
+            camera_angle = "iso1"
+
+        n_steps = len(self.assembly.sequence)
+        assembly_step_nr = n_steps - step_idx
+        step_title = f"Step {assembly_step_nr}"
+        is_initial = step_idx == n_steps - 1
+
+        present_ids = self._present_ids(step_idx)
+        # Use ablation-specific base render so we don't clobber the baseline.
+        base_suffix = "" if ablation == "full" else f"_{ablation}"
+        base_path = step_dir / f"01_base_render{base_suffix}.png"
+
+        if is_initial:
+            self._render_single_part_to_file(
+                step, base_path, size=(1024, 768), camera_angle=camera_angle
+            )
+            part_name = self.assembly.objects[step.obj_id].name
+            instruction = (
+                f"Place {part_name} on the work surface as the starting component."
+            )
+            (step_dir / "instruction.txt").write_text(instruction)
+        else:
+            self._render_base_composite_to_file(
+                step,
+                base_path,
+                size=(1024, 768),
+                present_ids=present_ids,
+                camera_angle=camera_angle,
+                include_motion=include_motion,
+            )
+            if include_text:
+                instruction = self._fetch_step_instruction(
+                    step, step_idx, step_dir, camera_angle=camera_angle
+                )
+            else:
+                instruction = ""
+
+        base = Image.open(base_path).convert("RGBA")
+
+        panel_size = (280, 380)
+        left_panel = None
+        right_panel = None
+        if not is_initial:
+            if step.rotated and step.pose is not None:
+                prev_pose = None
+                if step_idx + 1 < n_steps:
+                    prev_step = self.assembly.sequence[step_idx + 1]
+                    if prev_step.pose is not None:
+                        prev_pose = np.asarray(prev_step.pose, dtype=float)
+                left_panel = self._draw_offline_rotation_panel(
+                    step,
+                    panel_size=panel_size,
+                    present_ids=present_ids,
+                    prev_pose=prev_pose,
+                )
+                left_panel.save(step_dir / "02_rotation_panel.png")
+            if step.tool:
+                right_panel = self._draw_offline_tool_panel(step, panel_size=panel_size)
+                right_panel.save(step_dir / "03_tool_panel.png")
+
+        canvas = Image.new("RGBA", (1024, 1024), (255, 255, 255, 255))
+        canvas.paste(base, (0, 0))
+        if left_panel is not None:
+            canvas.alpha_composite(left_panel, (0, 0))
+        if right_panel is not None:
+            canvas.alpha_composite(right_panel, (1024 - right_panel.width, 0))
+        self._draw_bottom_instruction_text(
+            canvas, instruction, region=(0, 768, 1024, 1024), title=step_title
+        )
+        canvas_rgb = canvas.convert("RGB")
+
+        suffix = "" if ablation == "full" else f"_{ablation}"
+        output_top = save_dir / f"{step_idx}_{step.obj_id}_manual_offline{suffix}.png"
+        canvas_rgb.save(output_top)
+        if ablation == "full":
+            canvas_rgb.save(step_dir / "final.png")
+            self.assembly.instructions["Manual"].append(str(output_top))
+        return str(output_top)
+
+    # ------------------------------------------------------------------
+    # Iterative / geometric backend (mesh -> 2D SVG, LLM only for annotation)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _view_matrix_from_angle(angle, scene_center, scene_radius):
+        """Build a 4x4 view matrix matching the convention used by convert_angle_pv_pos.
+
+        Returns a matrix M whose rotation rows are the camera basis (right, up, -forward)
+        expressed in world space. M @ [x,y,z,1]^T gives the point in camera space, where
+        +x is screen-right, +y is screen-up, -z is the view direction.
+        """
+        # Eye directions mirror the sim camera_pos values in
+        # sequence_planner._render_plan so the geometric-SVG pipeline lines up
+        # with the sim-rendered GIFs.
+        if angle == "iso2":
+            eye_dir = np.array([-1.0, 1.0, 1.0])
+            up = np.array([0.0, 0.0, 1.0])
+        elif angle == "iso3":
+            eye_dir = np.array([-1.0, -1.0, 1.0])
+            up = np.array([0.0, 0.0, 1.0])
+        elif angle == "iso4":
+            eye_dir = np.array([1.0, 1.0, 1.0])
+            up = np.array([0.0, 0.0, 1.0])
+        else:  # iso1 (default)
+            eye_dir = np.array([1.0, -1.0, 1.0])
+            up = np.array([0.0, 0.0, 1.0])
+
+        eye_dir /= np.linalg.norm(eye_dir)
+        eye = scene_center + eye_dir * scene_radius * 3.0
+        forward = scene_center - eye
+        forward /= np.linalg.norm(forward)
+        right = np.cross(forward, up)
+        right /= np.linalg.norm(right)
+        true_up = np.cross(right, forward)
+
+        R = np.stack([right, true_up, -forward], axis=0)
+        t = -R @ eye
+        M = np.eye(4)
+        M[:3, :3] = R
+        M[:3, 3] = t
+        return M, forward
+
+    @staticmethod
+    def _project_points(points_world, view_matrix):
+        """Apply 4x4 view matrix; return Nx3 camera-space points (x=right, y=up, z=depth)."""
+        h = np.hstack([points_world, np.ones((len(points_world), 1))])
+        return (view_matrix @ h.T).T[:, :3]
+
+    @staticmethod
+    def _classify_edges(mesh, view_dir_world, crease_deg=30.0):
+        """Return (silhouette_edges, crease_edges) as Nx2 vertex-index arrays."""
+        face_normals = np.asarray(mesh.face_normals)
+        face_facing = (face_normals @ view_dir_world) < 0
+
+        sil = []
+        crease = []
+        for ei, (f1, f2) in enumerate(mesh.face_adjacency):
+            if face_facing[f1] != face_facing[f2]:
+                sil.append(mesh.face_adjacency_edges[ei])
+            elif mesh.face_adjacency_angles[ei] > np.radians(crease_deg):
+                if face_facing[f1] and face_facing[f2]:
+                    crease.append(mesh.face_adjacency_edges[ei])
+        return sil, crease
+
+    @staticmethod
+    def _filter_visible_edges(
+        source_vertices,
+        edges,
+        occluder_mesh,
+        view_dir_world,
+        view_matrix,
+        samples_per_edge=3,
+    ):
+        """Fast vectorized hidden-line removal for an orthographic camera.
+
+        For each edge, sample `samples_per_edge` points along it. Each sample is
+        projected to camera space and tested against every front-facing triangle
+        of the occluder mesh via a 2D point-in-triangle barycentric check + linear
+        depth comparison. A sample is hidden iff some triangle's projected outline
+        contains it AND that triangle's interpolated depth at the sample point is
+        closer to the camera. An edge survives if ANY of its samples is visible.
+
+        Vectorized in numpy; runs in milliseconds where the trimesh ray engine
+        would take minutes.
+        """
+        if not len(edges):
+            return edges
+        edges_arr = np.asarray(edges, dtype=int)
+        n_edges = len(edges_arr)
+        v0w = source_vertices[edges_arr[:, 0]]
+        v1w = source_vertices[edges_arr[:, 1]]
+
+        ts = np.linspace(0.15, 0.85, samples_per_edge)
+        samples_world = np.concatenate([v0w * (1 - t) + v1w * t for t in ts], axis=0)
+
+        s_h = np.hstack([samples_world, np.ones((len(samples_world), 1))])
+        samples_cam = (view_matrix @ s_h.T).T[:, :3]
+        sx = samples_cam[:, 0]
+        sy = samples_cam[:, 1]
+        sz = samples_cam[:, 2]
+
+        face_normals = np.asarray(occluder_mesh.face_normals)
+        front_mask = (face_normals @ view_dir_world) < 0
+        if not front_mask.any():
+            return edges
+
+        tri_v_world = occluder_mesh.vertices[occluder_mesh.faces[front_mask]]
+        m = len(tri_v_world)
+        tri_h = np.concatenate([tri_v_world, np.ones((m, 3, 1))], axis=2)
+        tri_cam = np.einsum("ij,mvj->mvi", view_matrix, tri_h)[..., :3]
+
+        ax, ay, az = tri_cam[:, 0, 0], tri_cam[:, 0, 1], tri_cam[:, 0, 2]
+        bx, by, bz = tri_cam[:, 1, 0], tri_cam[:, 1, 1], tri_cam[:, 1, 2]
+        cx, cy, cz = tri_cam[:, 2, 0], tri_cam[:, 2, 1], tri_cam[:, 2, 2]
+
+        denom = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+        valid = np.abs(denom) > 1e-12
+        denom_safe = np.where(valid, denom, 1.0)
+
+        sx_b = sx[:, None]
+        sy_b = sy[:, None]
+        a_bary = ((by - cy) * (sx_b - cx) + (cx - bx) * (sy_b - cy)) / denom_safe
+        b_bary = ((cy - ay) * (sx_b - cx) + (ax - cx) * (sy_b - cy)) / denom_safe
+        c_bary = 1.0 - a_bary - b_bary
+
+        eps_bary = 1e-7
+        inside = (a_bary >= -eps_bary) & (b_bary >= -eps_bary) & (c_bary >= -eps_bary)
+        inside &= valid[None, :]
+
+        tri_depth = a_bary * az + b_bary * bz + c_bary * cz
+
+        bbox = occluder_mesh.bounds[1] - occluder_mesh.bounds[0]
+        eps_depth = float(np.linalg.norm(bbox)) * 1e-3
+
+        occluded = inside & (tri_depth > sz[:, None] + eps_depth)
+        sample_hidden = occluded.any(axis=1)
+
+        sample_hidden = sample_hidden.reshape(samples_per_edge, n_edges)
+        any_visible = (~sample_hidden).any(axis=0)
+        return edges_arr[any_visible].tolist()
+
+    @staticmethod
+    def _normalize_to_canvas(cam_xy_groups, canvas_size, margin=0.08):
+        """Given a dict of group_id -> Nx2 camera-space (x, y) arrays, compute a shared
+        affine map that fits the union into canvas with `margin` fraction of padding.
+        Returns a function `to_px(arr)` that maps Nx2 cam-space points to image pixels."""
+        all_pts = np.vstack(list(cam_xy_groups.values()))
+        mn = all_pts.min(0)
+        mx = all_pts.max(0)
+        span = np.maximum(mx - mn, 1e-9)
+        usable_w = canvas_size[0] * (1.0 - 2.0 * margin)
+        usable_h = canvas_size[1] * (1.0 - 2.0 * margin)
+        scale = min(usable_w / span[0], usable_h / span[1])
+        offset_x = (canvas_size[0] - span[0] * scale) / 2.0 - mn[0] * scale
+        offset_y = (canvas_size[1] - span[1] * scale) / 2.0 - mn[1] * scale
+
+        def to_px(arr):
+            x_px = arr[:, 0] * scale + offset_x
+            y_px = canvas_size[1] - (arr[:, 1] * scale + offset_y)
+            return np.stack([x_px, y_px], axis=1)
+
+        return to_px
+
+    @staticmethod
+    def _svg_open(width, height):
+        return (
+            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'viewBox="0 0 {width} {height}" width="{width}" height="{height}">\n'
+            f'  <rect x="0" y="0" width="{width}" height="{height}" fill="white"/>\n'
+            "  <defs>\n"
+            '    <marker id="arrowhead" markerWidth="8" markerHeight="8" '
+            'refX="7" refY="4" orient="auto" markerUnits="strokeWidth">\n'
+            '      <polygon points="0,0 8,4 0,8" fill="black"/>\n'
+            "    </marker>\n"
+            "  </defs>\n"
+        )
+
+    @staticmethod
+    def _svg_close():
+        return "</svg>\n"
+
+    @staticmethod
+    def _svg_edges_layer(
+        group_id, edges_px, stroke="#888", stroke_width=1.0, dasharray=None
+    ):
+        if not len(edges_px):
+            return ""
+        dash_attr = f' stroke-dasharray="{dasharray}"' if dasharray else ""
+        lines = [
+            f'  <g id="{group_id}" stroke="{stroke}" stroke-width="{stroke_width}" '
+            f'fill="none" stroke-linecap="round"{dash_attr}>'
+        ]
+        for (x1, y1), (x2, y2) in edges_px:
+            lines.append(
+                f'    <line x1="{x1:.2f}" y1="{y1:.2f}" x2="{x2:.2f}" y2="{y2:.2f}"/>'
+            )
+        lines.append("  </g>")
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _svg_arrow(start_px, end_px, stroke="black", stroke_width=2.0, dasharray="8,5"):
+        x1, y1 = start_px
+        x2, y2 = end_px
+        return (
+            f'  <g id="assembly_arrow" stroke="{stroke}" stroke-width="{stroke_width}" fill="none">\n'
+            f'    <line x1="{x1:.2f}" y1="{y1:.2f}" x2="{x2:.2f}" y2="{y2:.2f}" '
+            f'stroke-dasharray="{dasharray}" marker-end="url(#arrowhead)"/>\n'
+            "  </g>\n"
+        )
+
+    @staticmethod
+    def _svg_text(x, y, text, font_size=20, anchor="start", fill="black"):
+        safe = (
+            (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        )
+        return (
+            f'  <text x="{x:.2f}" y="{y:.2f}" font-family="Arial, sans-serif" '
+            f'font-size="{font_size}" fill="{fill}" text-anchor="{anchor}">{safe}</text>\n'
+        )
+
+    @staticmethod
+    def _svg_circle(cx, cy, r, fill="none", stroke="black", stroke_width=2.0):
+        return (
+            f'  <circle cx="{cx:.2f}" cy="{cy:.2f}" r="{r:.2f}" '
+            f'fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}"/>\n'
+        )
+
+    def _svg_to_png(self, svg_text, png_path, width=1024, height=1024):
+        """Rasterize an SVG string to PNG. Falls back through cairosvg → svglib → no-op."""
+        try:
+            import cairosvg
+
+            cairosvg.svg2png(
+                bytestring=svg_text.encode("utf-8"),
+                write_to=str(png_path),
+                output_width=width,
+                output_height=height,
+            )
+            return True
+        except ImportError:
+            pass
+
+        try:
+            from io import BytesIO
+
+            from reportlab.graphics import renderPM
+            from svglib.svglib import svg2rlg
+
+            drawing = svg2rlg(BytesIO(svg_text.encode("utf-8")))
+            renderPM.drawToFile(drawing, str(png_path), fmt="PNG")
+            return True
+        except ImportError:
+            print(
+                "Warning: neither cairosvg nor svglib installed. "
+                "SVG saved but PNG render skipped — install cairosvg for full pipeline."
+            )
+            return False
+        except Exception as e:
+            print(f"Warning: SVG-to-PNG rasterization failed: {e}")
+            return False
+
+    def _build_geometric_svg(self, step, canvas_size=(1024, 1024), margin_frac=0.05):
+        """Project all assembly parts to 2D and compose a base SVG with:
+          - already-assembled parts in light gray
+          - moving part in black, positioned so its bbox is JUST OUTSIDE the
+            rest-of-assembly bbox along the assembly direction (orientation from
+            the full assembly path is preserved, only the along-axis offset is
+            recomputed). A small margin gap is added between the two bboxes.
+          - per-silhouette-vertex motion trails from drawn -> assembled position
+          - one small dashed central arrow with arrowhead
+
+        `margin_frac` is the gap between the two bboxes as a fraction of the
+        rest-of-assembly bbox diagonal.
+        """
+        angle = self._best_angle(step) if step.images else "iso"
+
+        moving_obj = self.assembly.objects[step.obj_id]
+        moving_mesh_assembled = moving_obj.tri_mesh
+
+        transform = (
+            self.assembly._to_canonical(step, step.matrices[-1])
+            if step.matrices
+            else np.eye(4)
+        )
+        moving_mesh_disassembled_full = moving_mesh_assembled.copy().apply_transform(
+            transform
+        )
+
+        rest_meshes = [
+            obj.tri_mesh.vertices
+            for obj in self.assembly.objects.values()
+            if obj.id != step.obj_id
+        ]
+        if rest_meshes:
+            rest_verts = np.vstack(rest_meshes)
+            rest_diag = float(np.linalg.norm(rest_verts.max(0) - rest_verts.min(0)))
+        else:
+            rest_verts = moving_mesh_assembled.vertices
+            rest_diag = float(np.linalg.norm(rest_verts.max(0) - rest_verts.min(0)))
+
+        disp = moving_mesh_disassembled_full.centroid - moving_mesh_assembled.centroid
+        disp_len = float(np.linalg.norm(disp))
+
+        v = np.array([0.0, 0.0, 1.0]) if disp_len < 1e-09 else disp / disp_len
+
+        margin = rest_diag * margin_frac
+        rest_proj = rest_verts @ v
+        moving_proj_assembled = moving_mesh_assembled.vertices @ v
+        required_along_axis = (rest_proj.max() + margin) - moving_proj_assembled.min()
+
+        correction = v * required_along_axis - disp
+        extra = np.eye(4)
+        extra[:3, 3] = correction
+        moving_mesh_drawn = moving_mesh_disassembled_full.copy().apply_transform(extra)
+
+        all_verts = [obj.tri_mesh.vertices for obj in self.assembly.objects.values()]
+        all_verts.append(moving_mesh_drawn.vertices)
+        stacked = np.vstack(all_verts)
+        scene_center = (stacked.min(0) + stacked.max(0)) / 2.0
+        scene_radius = float(np.linalg.norm(stacked.max(0) - stacked.min(0)) / 2.0)
+
+        view_matrix, view_dir_world = self._view_matrix_from_angle(
+            angle, scene_center, scene_radius
+        )
+
+        non_moving = [
+            obj for obj in self.assembly.objects.values() if obj.id != step.obj_id
+        ]
+        combined_rest = None
+        if non_moving:
+            try:
+                combined_rest = trimesh.boolean.union(
+                    [obj.tri_mesh for obj in non_moving]
+                )
+            except Exception as e:
+                print(f"  boolean.union failed ({e}); falling back to concatenate.")
+                combined_rest = trimesh.util.concatenate(
+                    [obj.tri_mesh.copy() for obj in non_moving]
+                )
+                combined_rest.merge_vertices()
+
+        cam_xy_groups = {}
+        per_part_cam = {}
+        for obj in non_moving:
+            cam_pts = self._project_points(obj.tri_mesh.vertices, view_matrix)
+            per_part_cam[obj.id] = cam_pts
+            cam_xy_groups[obj.id] = cam_pts[:, :2]
+
+        if combined_rest is not None:
+            combined_cam = self._project_points(combined_rest.vertices, view_matrix)
+            cam_xy_groups["__rest__"] = combined_cam[:, :2]
+            rest_sil, rest_crease = self._classify_edges(combined_rest, view_dir_world)
+            rest_sil = self._filter_visible_edges(
+                combined_rest.vertices,
+                rest_sil,
+                combined_rest,
+                view_dir_world,
+                view_matrix,
+            )
+            rest_crease = self._filter_visible_edges(
+                combined_rest.vertices,
+                rest_crease,
+                combined_rest,
+                view_dir_world,
+                view_matrix,
+            )
+
+        cam_pts_moving = self._project_points(moving_mesh_drawn.vertices, view_matrix)
+        cam_xy_groups["__moving__"] = cam_pts_moving[:, :2]
+        sil_m, crease_m = self._classify_edges(moving_mesh_drawn, view_dir_world)
+        if combined_rest is not None:
+            world_mesh = trimesh.util.concatenate(
+                [moving_mesh_drawn.copy(), combined_rest.copy()]
+            )
+        else:
+            world_mesh = moving_mesh_drawn
+        sil_m = self._filter_visible_edges(
+            moving_mesh_drawn.vertices, sil_m, world_mesh, view_dir_world, view_matrix
+        )
+        crease_m = self._filter_visible_edges(
+            moving_mesh_drawn.vertices,
+            crease_m,
+            world_mesh,
+            view_dir_world,
+            view_matrix,
+        )
+
+        to_px = self._normalize_to_canvas(cam_xy_groups, canvas_size)
+
+        svg_parts = [self._svg_open(*canvas_size)]
+        assembled_parts_info = []
+
+        if combined_rest is not None:
+            combined_px = to_px(combined_cam[:, :2])
+            sil_lines = [(combined_px[a], combined_px[b]) for a, b in rest_sil]
+            crease_lines = [(combined_px[a], combined_px[b]) for a, b in rest_crease]
+            svg_parts.append(
+                self._svg_edges_layer(
+                    "rest_assembly_sil", sil_lines, stroke="#666", stroke_width=1.2
+                )
+            )
+            svg_parts.append(
+                self._svg_edges_layer(
+                    "rest_assembly_crease",
+                    crease_lines,
+                    stroke="#aaa",
+                    stroke_width=0.6,
+                )
+            )
+
+            for obj in non_moving:
+                pts_px = to_px(per_part_cam[obj.id][:, :2])
+                assembled_parts_info.append(
+                    {
+                        "name": obj.name,
+                        "centroid_px": pts_px.mean(0).tolist(),
+                    }
+                )
+
+        mv_px = to_px(cam_pts_moving[:, :2])
+        mv_sil_lines = [(mv_px[a], mv_px[b]) for a, b in sil_m]
+        mv_crease_lines = [(mv_px[a], mv_px[b]) for a, b in crease_m]
+        svg_parts.append(
+            self._svg_edges_layer(
+                f"part_{step.obj_id}_sil",
+                mv_sil_lines,
+                stroke="black",
+                stroke_width=2.2,
+            )
+        )
+        svg_parts.append(
+            self._svg_edges_layer(
+                f"part_{step.obj_id}_crease",
+                mv_crease_lines,
+                stroke="#333",
+                stroke_width=0.9,
+            )
+        )
+        moving_centroid_px = mv_px.mean(0).tolist()
+        mv = {"sil": sil_m}
+
+        if len(mv["sil"]):
+            sil_vidx = np.unique(np.asarray(mv["sil"]).reshape(-1))
+            drawn_world = moving_mesh_drawn.vertices[sil_vidx]
+            assembled_world = moving_mesh_assembled.vertices[sil_vidx]
+            drawn_sub_px = to_px(self._project_points(drawn_world, view_matrix)[:, :2])
+            assembled_sub_px = to_px(
+                self._project_points(assembled_world, view_matrix)[:, :2]
+            )
+            motion_lines = list(zip(drawn_sub_px, assembled_sub_px, strict=False))
+            svg_parts.append(
+                self._svg_edges_layer(
+                    "motion_trails",
+                    motion_lines,
+                    stroke="#999",
+                    stroke_width=0.5,
+                    dasharray="4,3",
+                )
+            )
+
+        cam_assembled = self._project_points(
+            np.array([moving_mesh_assembled.centroid]), view_matrix
+        )
+        cam_drawn = self._project_points(
+            np.array([moving_mesh_drawn.centroid]), view_matrix
+        )
+        end_px_arr = to_px(cam_assembled[:, :2])[0]
+        start_px_arr = to_px(cam_drawn[:, :2])[0]
+        svg_parts.append(self._svg_arrow(start_px_arr.tolist(), end_px_arr.tolist()))
+
+        svg_parts.append(self._svg_close())
+        svg_text = "".join(svg_parts)
+
+        info = {
+            "angle": angle,
+            "canvas_size": list(canvas_size),
+            "arrow_start_px": [float(start_px_arr[0]), float(start_px_arr[1])],
+            "arrow_end_px": [float(end_px_arr[0]), float(end_px_arr[1])],
+            "moving_part_centroid_px": [
+                float(moving_centroid_px[0]),
+                float(moving_centroid_px[1]),
+            ],
+            "moving_part_name": moving_obj.name,
+            "assembled_parts": assembled_parts_info,
+            "assembly_direction_world": (
+                (
+                    moving_mesh_assembled.centroid
+                    - moving_mesh_disassembled_full.centroid
+                ).tolist()
+            ),
+            "rest_assembly_diagonal": rest_diag,
+            "required_offset_along_axis": float(required_along_axis),
+            "original_disassembly_distance": disp_len,
+        }
+        return svg_text, info
+
+    def _llm_decide_annotations(self, client, step, info):
+        """Ask the LLM to decide labels / callout positions / tool icon / zoom inset.
+        Receives structured data only — no rendered image."""
+        moving_obj = self.assembly.objects[step.obj_id]
+        parts_fix_names = [
+            self.assembly.objects[pid].name
+            if pid in self.assembly.objects
+            else str(pid)
+            for pid in (step.parts_fix or [])
+        ]
+        step_description = {
+            "moving_part_name": moving_obj.name,
+            "assembly_direction_world": info["assembly_direction_world"],
+            "tool_required": step.tool,
+            "rotation_required": bool(step.rotated),
+            "parts_held_fixed": parts_fix_names,
+            "moving_part_centroid_2d": info["moving_part_centroid_px"],
+            "arrow_start_2d": info["arrow_start_px"],
+            "arrow_end_2d": info["arrow_end_px"],
+            "canvas_size": info["canvas_size"],
+            "assembled_parts": info["assembled_parts"],
+        }
+        user_content = [
+            {
+                "type": "text",
+                "text": (
+                    "Decide annotation placement for one IKEA-style manual page. "
+                    "Geometry is already drawn correctly; you only choose labels and metadata.\n\n"
+                    f"Step data:\n{json.dumps(step_description, indent=2)}"
+                ),
+            }
+        ]
+        response = client.chat.completions.parse(
+            model=settings.LLM_model,
+            messages=self.assembly._make_messages(_SYSTEM_ANNOTATION, user_content),
+            response_format=AnnotationDecision,
+        )
+        if self.assembly.evaluation:
+            self.assembly.evaluation.tokens_used += response.usage.total_tokens
+        return response.choices[0].message.parsed
+
+    def _compose_final_svg(self, base_svg, annotation, info, canvas_size=(1024, 1024)):
+        """Re-emit the SVG with annotation overlays (label, optional tool icon, optional zoom inset)."""
+        body = base_svg[: base_svg.rfind("</svg>")]
+        overlay = []
+
+        if annotation.label_text:
+            lx, ly = annotation.callout_position
+            mx, my = info["moving_part_centroid_px"]
+            overlay.append(
+                f'  <line x1="{lx:.2f}" y1="{ly:.2f}" x2="{mx:.2f}" y2="{my:.2f}" '
+                f'stroke="black" stroke-width="1" stroke-dasharray="3,3"/>\n'
+            )
+            overlay.append(
+                self._svg_text(
+                    lx, ly, annotation.label_text, font_size=22, anchor="middle"
+                )
+            )
+
+        step_tool = getattr(self, "_last_step_tool", None)
+        if annotation.show_tool_icon and step_tool:
+            tx, ty = annotation.tool_icon_position
+            overlay.append(
+                self._svg_circle(
+                    tx, ty, 24, fill="white", stroke="black", stroke_width=2
+                )
+            )
+            overlay.append(
+                self._svg_text(tx, ty + 6, "T", font_size=20, anchor="middle")
+            )
+            overlay.append(
+                self._svg_text(
+                    tx, ty + 44, str(step_tool), font_size=14, anchor="middle"
+                )
+            )
+
+        if annotation.add_zoom_inset:
+            iw = int(canvas_size[0] * 0.28)
+            ih = int(canvas_size[1] * 0.28)
+            x0 = canvas_size[0] - iw - 30
+            y0 = 30
+            mx, my = info["moving_part_centroid_px"]
+            overlay.append(
+                f'  <rect x="{x0}" y="{y0}" width="{iw}" height="{ih}" '
+                f'fill="white" stroke="black" stroke-width="2"/>\n'
+            )
+            overlay.append(
+                f'  <line x1="{mx:.2f}" y1="{my:.2f}" x2="{x0}" y2="{y0 + ih}" '
+                f'stroke="black" stroke-width="1" stroke-dasharray="3,3"/>\n'
+            )
+            overlay.append(
+                self._svg_text(
+                    x0 + iw / 2,
+                    y0 + ih / 2,
+                    "zoom",
+                    font_size=14,
+                    anchor="middle",
+                    fill="#888",
+                )
+            )
+
+        if annotation.step_note:
+            overlay.append(
+                self._svg_text(
+                    canvas_size[0] / 2,
+                    canvas_size[1] - 30,
+                    annotation.step_note,
+                    font_size=18,
+                    anchor="middle",
+                )
+            )
+
+        return body + "".join(overlay) + "</svg>\n"
+
+    def generate_manual_iterative(self, step_idx):
+        """Geometric manual generation: mesh -> 2D projection -> SVG composition,
+        with an LLM call only for annotation placement.
+
+        Outputs:
+          manual/step_{idx}_{obj_id}/geometric.svg     — base, no annotations
+          manual/step_{idx}_{obj_id}/info.json         — projection metadata
+          manual/step_{idx}_{obj_id}/annotation.json   — LLM decision
+          manual/step_{idx}_{obj_id}/final.svg + .png
+          manual/{idx}_{obj_id}_manual.svg + .png      — copies for backward compat
+        """
+        if self.assembly.evaluation and self.assembly.evaluation.verbose:
+            print(f"\nCreating geometric manual for step {step_idx}...")
+
+        step = self.assembly.sequence[step_idx]
+        save_dir = (
+            self.assembly.output_dir / "manual" / f"step_{step_idx}_{step.obj_id}"
+        )
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            base_svg, info = self._build_geometric_svg(step)
+        except Exception as e:
+            print(f"Geometric SVG build failed for step {step_idx}: {e}")
+            return None
+
+        (save_dir / "geometric.svg").write_text(base_svg)
+        (save_dir / "info.json").write_text(json.dumps(info, indent=2))
+
+        annotation = AnnotationDecision(
+            label_text=self.assembly.objects[step.obj_id].name,
+            callout_position=[
+                min(
+                    max(info["moving_part_centroid_px"][0] + 80, 60),
+                    info["canvas_size"][0] - 60,
+                ),
+                max(info["moving_part_centroid_px"][1] - 80, 40),
+            ],
+            show_tool_icon=bool(step.tool),
+            tool_icon_position=[
+                info["canvas_size"][0] - 80,
+                info["canvas_size"][1] - 80,
+            ],
+            add_zoom_inset=False,
+            step_note=None,
+        )
+
+        if not (
+            self.assembly.evaluation
+            and self.assembly.evaluation.tokens_exhausted(
+                f"generate_manual_iterative annotate (step {step_idx})"
+            )
+        ):
+            try:
+                client = OpenAI(api_key=self.assembly.openai_api_key)
+                annotation = self._llm_decide_annotations(client, step, info)
+            except Exception as e:
+                print(
+                    f"Annotation LLM call failed for step {step_idx}: {e} — using defaults."
+                )
+
+        (save_dir / "annotation.json").write_text(annotation.model_dump_json(indent=2))
+
+        self._last_step_tool = step.tool
+        final_svg = self._compose_final_svg(
+            base_svg, annotation, info, canvas_size=tuple(info["canvas_size"])
+        )
+        final_svg_path = save_dir / "final.svg"
+        final_png_path = save_dir / "final.png"
+        final_svg_path.write_text(final_svg)
+        png_ok = self._svg_to_png(
+            final_svg,
+            final_png_path,
+            width=info["canvas_size"][0],
+            height=info["canvas_size"][1],
+        )
+
+        top_svg = (
+            self.assembly.output_dir / "manual" / f"{step_idx}_{step.obj_id}_manual.svg"
+        )
+        top_png = (
+            self.assembly.output_dir / "manual" / f"{step_idx}_{step.obj_id}_manual.png"
+        )
+        top_svg.write_text(final_svg)
+        if png_ok:
+            top_png.write_bytes(final_png_path.read_bytes())
+            self.assembly.instructions["Manual"].append(str(top_png))
+            return str(top_png)
+        self.assembly.instructions["Manual"].append(str(top_svg))
+        return str(top_svg)
+
+    # ------------------------------------------------------------------
+    # Dispatch
+    # ------------------------------------------------------------------
+    def make_manual(self, step_idx, ablation="full"):
+        """Dispatch to a manual-generation backend based on settings.manual_method.
+
+        Two backends are supported:
+          "offline"   — generate_manual_offline: no VLM/LLM calls.
+          "geometric" — generate_manual_iterative: SVG silhouette/crease +
+                        iterative LLM annotations (the generative backend).
+
+        ablation: forwarded to the offline backend (the only one supporting
+            component-ablation runs); ignored by the geometric backend."""
+        method = getattr(settings, "manual_method", "offline")
+        if method == "geometric":
+            return self.generate_manual_iterative(step_idx)
+        if method != "offline":
+            print(
+                f"Unknown settings.manual_method='{method}'; falling back to offline."
+            )
+        return self.generate_manual_offline(step_idx, ablation=ablation)
