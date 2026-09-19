@@ -650,6 +650,12 @@ class SequencePlanner:
             sys.path.insert(0, asap_dir)
         # Evict all top-level packages that both ATA and ASAPx define, so ASAPx
         # re-imports its own versions now that its dir is first in sys.path.
+        # NOTE: "settings" is deliberately NOT in this set. There is exactly
+        # one settings.py in the repo (the root one) -- neither ATA nor ASAPx
+        # ships its own -- so evicting it cannot resolve a name clash; it only
+        # forces a fresh re-read from disk, silently discarding every runtime
+        # override the caller set (heuristic_weights_source="optuna",
+        # render_sequence=False, debug_stability=False, ...) before planning.
         _asapx_pkgs = {
             "assets",
             "utils",
@@ -657,7 +663,6 @@ class SequencePlanner:
             "plan_path",
             "plan_robot",
             "plan_sequence",
-            "settings",
         }
         for _mod in list(sys.modules.keys()):
             if _mod in _asapx_pkgs or any(
@@ -960,6 +965,12 @@ class SequencePlanner:
         asap_dir = os.path.join(project_base_dir, "ASAPx")
         if asap_dir not in sys.path:
             sys.path.insert(0, asap_dir)
+        # NOTE: "settings" is deliberately NOT in this set. There is exactly
+        # one settings.py in the repo (the root one) -- neither ATA nor ASAPx
+        # ships its own -- so evicting it cannot resolve a name clash; it only
+        # forces a fresh re-read from disk, silently discarding every runtime
+        # override the caller set (heuristic_weights_source="optuna",
+        # render_sequence=False, debug_stability=False, ...) before planning.
         _asapx_pkgs = {
             "assets",
             "utils",
@@ -967,7 +978,6 @@ class SequencePlanner:
             "plan_path",
             "plan_robot",
             "plan_sequence",
-            "settings",
         }
         for _mod in list(sys.modules.keys()):
             if _mod in _asapx_pkgs or any(

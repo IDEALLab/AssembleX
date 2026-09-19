@@ -34,7 +34,7 @@ tool_assemblability = False
 # even on assemblies that planned successfully. False by default — successful
 # runs skip feedback entirely; failure feedback on non-assemblable runs is
 # unaffected by this switch.
-feedback_on_success = True
+feedback_on_success = False
 
 # When True and static collisions are detected at pipeline start, attempt to
 # nudge each colliding part with the geometric collision resolver before
@@ -85,6 +85,32 @@ max_frontier = 4
 #                       subsequent stability check
 no_stable_pose_action = "exit"
 
+# Tolerance applied BEFORE no_stable_pose_action fires. When the precheck finds
+# no fully self-supporting pose, accept the best candidate pose that needs at
+# most this many parts held (i.e. at most this many parts fall under gravity),
+# and treat those parts as held for every subsequent stability check -- the
+# operator/robot is assumed to steady them. The pose with the fewest falling
+# parts wins; ties break by trimesh probability order. 0 restores the strict
+# behavior (any falling part rejects the pose). Most real assemblies in
+# data/asap fail the strict check on only one or two parts, so a small budget
+# here recovers them without weakening stability checking elsewhere.
+max_initial_held_parts = 2
+
+# Per-assembly wall-clock ceiling for data_sequence_runtime, in seconds.
+# The parallel search can deadlock on pathological assemblies (parent blocked
+# in queue.get() while workers sit idle); without a ceiling a single bad
+# assembly stalls a multi-hour batch indefinitely. The assembly is recorded as
+# a timeout and the batch moves on. 0 disables the watchdog.
+#
+# The ceiling scales with assembly size, because legitimate planning cost grows
+# steeply with part count -- a flat timeout that is generous at 20 parts would
+# cut off honest work at 30. The budget at `ref_parts` is the value below, and
+# it is scaled by (n_parts / ref_parts) ** exponent, with the exponent taken
+# from the measured wall_s ~ parts^1.45 fit. Never scaled below the base.
+seq_runtime_assembly_timeout_s = 10800
+seq_runtime_timeout_ref_parts = 20
+seq_runtime_timeout_exponent = 1.45
+
 # When True, the planner pauses on the root node, renders one image per
 # candidate initial stable pose, and asks the user to pick which one to use
 # as the assembly's starting orientation. Falls back to the default
@@ -99,7 +125,7 @@ interactive_initial_pose = False
 # get_stable_plan_1pose_serial. The render reuses the redmax sim's already-
 # populated q_his/qdot_his from the forward() loop — no re-simulation, so the
 # overhead is roughly the cost of one GIF encode per attempt.
-debug_stability = True
+debug_stability = False
 
 # Whether to filter out candidate disassembly actions that would cause parts to
 # pass through the ground.

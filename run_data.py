@@ -9,19 +9,30 @@ import os
 import pickle
 import random
 import shutil
+import signal
 import sys
 import time
 from collections import Counter
 from pathlib import Path
 
+import matplotlib
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import pyvista as pv
 from PIL import Image as PILImage
 
+# Pin a non-interactive backend before any figure is created. matplotlib
+# defaults to an interactive backend (qtagg) in this environment, and ASAPx's
+# DFASequencePlanner.plot_tree calls plt.subplots() unconditionally at the end
+# of planning -- under a GUI backend that blocks on the display server and
+# deadlocks the planner. The backend is process-global, and run_data is
+# imported by main.py before ASAPx is ever loaded, so this covers the
+# planner's figures too.
+matplotlib.use("Agg")
+
 import settings
-from run_common import _write_comparison_batch_summary
+from run_common import _write_comparison_batch_summary, candidates_by_part_count
 from core.simulation import ContactTree
 from core.tool_eval import ToolEvaluator
 
@@ -460,6 +471,7 @@ def run_train_heuristic_weights(args, test_eval, output_folder, assembly_dir):
     asap_dir = os.path.join(project_base_dir, "ASAPx")
     if asap_dir not in sys.path:
         sys.path.insert(0, asap_dir)
+    # NOTE: "settings" is deliberately absent -- see core/sequence_planner.py.
     _asapx_pkgs = {
         "assets",
         "utils",
@@ -467,7 +479,6 @@ def run_train_heuristic_weights(args, test_eval, output_folder, assembly_dir):
         "plan_path",
         "plan_robot",
         "plan_sequence",
-        "settings",
     }
     for _mod in list(sys.modules.keys()):
         if _mod in _asapx_pkgs or any(_mod.startswith(p + ".") for p in _asapx_pkgs):
@@ -875,24 +886,17 @@ def run_data_assembly_time(args, test_eval, output_folder, assembly_dir):
     # Each run gets its own storage subdir so runs don't clobber each
     # other's tree.pkl / arm_plans.json / timing_overview.json.
     # ------------------------------------------------------------------
+    # Three-way comparison requested for the trained-weights study:
+    #   base            -- the heur-out generator (no learned weights)
+    #   dfa trained     -- heuristic planner under the Optuna-trained weights
+    #   + splitting     -- the same, plus the divide optimizer (subassemblies)
+    # A "<base>+optimizer" run reuses "<base>"'s tree, so the split is always
+    # measured against its own baseline. Set SEQ_RUNS env var to override.
     RUNS = [
         # (label, planner, generator)
-        ("heuristic", "heuristic", "rand"),
-        (
-            "heuristic_trained",
-            "heuristic",
-            "rand",
-        ),  # heuristic w/ Optuna-trained weights
-        (
-            "heuristic+optimizer",
-            "heuristic",
-            "rand",
-        ),  # reuses heuristic tree + divide optimizer
         ("gen:heur-out", "gen-adapter", "heur-out"),
-        # ("gen:heur-vol",       "gen-adapter", "heur-vol"),
-        # ("gen:learn",          "gen-adapter", "learn"),
-        ("gen:rand", "gen-adapter", "rand"),
-        # ("gen:dfa",           "gen-adapter", "dfa"),
+        ("heuristic_trained", "heuristic", "rand"),
+        ("heuristic_trained+optimizer", "heuristic", "rand"),
     ]
     COMPONENTS = (
         "step_disassembly_s",
@@ -1329,11 +1333,16 @@ def run_data_assembly_time(args, test_eval, output_folder, assembly_dir):
                 # mirroring the cost decomposition in compare.py. If no
                 # split is verified, falls back to the heuristic timing.
                 # ------------------------------------------------------
-                if run_label == "heuristic+optimizer":
+                if run_label.endswith("+optimizer"):
+                    # Reuse the tree + timing of the run this one is derived
+                    # from ("<base>+optimizer" builds on "<base>"), so the
+                    # divide optimizer is compared against its own baseline
+                    # rather than always against the default-weight run.
+                    _base_label = run_label[: -len("+optimizer")]
                     heur_cache_log = (
-                        base_storage / "assembly_time" / "heuristic" / "log"
+                        base_storage / "assembly_time" / _base_label / "log"
                     )
-                    heur_output_log = at_dir / str(ass.id) / "heuristic" / "log"
+                    heur_output_log = at_dir / str(ass.id) / _base_label / "log"
                     req_paths = [
                         heur_cache_log / "tree.pkl",
                         heur_cache_log / "stats.json",
@@ -1343,10 +1352,10 @@ def run_data_assembly_time(args, test_eval, output_folder, assembly_dir):
                         missing = [str(p) for p in req_paths if not p.exists()]
                         results[ass.id][run_label] = {
                             "status": "error",
-                            "error": f"heuristic run artifacts missing: {missing}",
+                            "error": f"{_base_label} run artifacts missing: {missing}",
                         }
                         print(
-                            f"[assembly-time]    {run_label}: heuristic artifacts missing"
+                            f"[assembly-time]    {run_label}: {_base_label} artifacts missing"
                         )
                         continue
                     try:
@@ -1612,7 +1621,7 @@ def run_data_assembly_time(args, test_eval, output_folder, assembly_dir):
                     _orig_hw_source = getattr(
                         settings, "heuristic_weights_source", "default"
                     )
-                    if run_label == "heuristic_trained":
+                    if run_label.startswith("heuristic_trained"):
                         settings.heuristic_weights_source = "optuna"
                     try:
                         ass.planner.get_assembly_plans(args)
@@ -1774,6 +1783,876 @@ def run_data_assembly_time(args, test_eval, output_folder, assembly_dir):
             _write_assembly_time_summary()
         except Exception as _e:
             print(f"[assembly-time] failed to write summary: {_e}")
+
+
+# Wall-clock components reported per assembly. The first five are the
+# planner's own instrumented buckets (persisted into log/stats.json by
+# SequencePlanner.log); `search_overhead` is planner wall-clock those
+# buckets don't account for, `setup` is everything outside the planner
+# (SDF clearing, mesh/tool preparation, artifact IO).
+# Worker-side CPU buckets: these run inside parallel_execute workers, so with
+# num_proc > 1 they sum to far more than the planner's wall-clock.
+_SR_PARALLEL_COMPONENTS = (
+    "sim_build",
+    "path_finding",
+    "dof",
+    "stability_check",
+    "stable_pose",
+    "grasp_planning",
+    "tool_check",
+)
+# Measured as wall-clock inside the planner (not parallel worker time), so it
+# is carved out of the planner window before the CPU buckets are scaled into
+# what remains.
+_SR_WALL_PHASES = ("initial_precheck",)
+# Full per-assembly breakdown, in stack order.
+_SR_COMPONENTS = (
+    "preprocess",
+    "setup",
+    *_SR_WALL_PHASES,
+    *_SR_PARALLEL_COMPONENTS,
+    "search_overhead",
+)
+_SR_COLORS = {
+    "preprocess": "#B07AA1",
+    "setup": "#999999",
+    "initial_precheck": "#76B7B2",
+    "sim_build": "#9C755F",
+    "path_finding": "#4C72B0",
+    "dof": "#59A14F",
+    "stability_check": "#55A868",
+    "stable_pose": "#C44E52",
+    "grasp_planning": "#8172B2",
+    "tool_check": "#CCB974",
+    "search_overhead": "#937860",
+}
+_SR_LABELS = {
+    "preprocess": "preprocessing",
+    "setup": "setup / IO",
+    "initial_precheck": "initial-pose precheck",
+    "sim_build": "sim build (SDF)",
+    "path_finding": "path finding",
+    "dof": "DoF probe",
+    "stability_check": "stability check",
+    "stable_pose": "stable poses",
+    "grasp_planning": "grasp planning",
+    "tool_check": "tool check",
+    "search_overhead": "search overhead",
+}
+
+
+def _sr_components_for(records):
+    """Pick the finest component set every record can express.
+
+    Records produced before `sim_build` / `dof` / `initial_precheck` existed
+    fold those costs into `path_finding`. Mixing the two schemes in one stacked
+    chart would draw false zeros for the older runs, so when any record lacks
+    the finer buckets the whole set is collapsed to the coarse scheme:
+    `path_finding + sim_build + dof` is exactly what the old `path_finding`
+    measured, making this an exact reconciliation rather than an estimate.
+
+    Returns (components, collapse_fn, mixed) where collapse_fn maps one
+    record's wall_breakdown onto `components`.
+    """
+    fine = ("sim_build", "dof", "initial_precheck")
+    mixed = any(
+        not any(k in (r.get("wall_breakdown") or {}) for k in fine)
+        for r in records
+        if r.get("wall_breakdown")
+    )
+    if not mixed:
+        return (
+            _SR_COMPONENTS,
+            (lambda wb: {c: float(wb.get(c, 0.0)) for c in _SR_COMPONENTS}),
+            False,
+        )
+
+    coarse = tuple(c for c in _SR_COMPONENTS if c not in ("sim_build", "dof"))
+
+    def _collapse(wb):
+        out = {c: float(wb.get(c, 0.0) or 0.0) for c in coarse}
+        out["path_finding"] += float(wb.get("sim_build", 0.0) or 0.0)
+        out["path_finding"] += float(wb.get("dof", 0.0) or 0.0)
+        return out
+
+    return coarse, _collapse, True
+
+
+def _sr_cap_kind(rec):
+    """Classify a run terminated by a resource limit rather than by the search.
+
+    Returns "budget" (hit the evaluation budget), "timeout" (hit the per-assembly
+    watchdog) or None. These are not valid runtime measurements -- the clock was
+    stopped by a limit -- so they stay out of the means and fits, but they are
+    worth drawing so the reader can see where the ceiling bites.
+    """
+    if rec.get("status") == "ok":
+        return None
+    if (rec.get("stop_msg") or "") == "budget reached":
+        return "budget"
+    blob = f"{rec.get('error') or ''} {rec.get('stop_msg') or ''}".lower()
+    if (
+        "timeout" in blob
+        or "exceeded seq_runtime" in blob
+        or blob.strip() == "exception"
+    ):
+        return "timeout"
+    return None
+
+
+def _sr_part_concentration(by_part):
+    """Summarise how unevenly simulation cost is spread over parts.
+
+    Answers "is one part doing all the work?": `top_share` is the largest
+    single part's fraction of total sim time, `top3_share` the largest three,
+    and `max_over_median` how many times the worst part costs versus a typical
+    one. Returns None when there is nothing to summarise.
+    """
+    vals = sorted((float(v) for v in by_part.values() if v is not None), reverse=True)
+    vals = [v for v in vals if v > 0]
+    if len(vals) < 2:
+        return None
+    total = sum(vals)
+    mid = len(vals) // 2
+    median = vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2.0
+    return {
+        "n_parts_timed": len(vals),
+        "total_s": round(total, 3),
+        "top_part_s": round(vals[0], 3),
+        "top_share": round(vals[0] / total, 4),
+        "top3_share": round(sum(vals[:3]) / total, 4),
+        "median_part_s": round(median, 3),
+        "max_over_median": round(vals[0] / median, 2) if median > 0 else None,
+    }
+
+
+def _sr_timeout_for(n_parts):
+    """Per-assembly watchdog ceiling, scaled by part count.
+
+    Planning cost grows as roughly parts^1.45, so a flat ceiling that is
+    generous at 20 parts would guillotine legitimate work at 30. Returns 0 when
+    the watchdog is disabled.
+    """
+    base = int(getattr(settings, "seq_runtime_assembly_timeout_s", 0) or 0)
+    if base <= 0:
+        return 0
+    ref = float(getattr(settings, "seq_runtime_timeout_ref_parts", 20) or 20)
+    exp = float(getattr(settings, "seq_runtime_timeout_exponent", 1.45) or 1.45)
+    scale = max(1.0, float(n_parts) / ref) ** exp
+    return int(base * scale)
+
+
+def _sr_kill_orphan_workers():
+    """Reap parallel_execute workers left behind when a planning call is
+    abandoned. Without this the deadlocked children survive the timeout and
+    keep their share of the machine for the rest of the batch."""
+    import multiprocessing as _mp
+
+    for _child in _mp.active_children():
+        try:
+            _child.terminate()
+            _child.join(timeout=5)
+        except Exception:
+            pass
+
+
+def _sr_attribute_wall_time(planner_s, setup_s, cpu_breakdown, preprocess_s=0.0):
+    """Split a run's measured wall-clock into `_SR_COMPONENTS`.
+
+    Three kinds of time are handled differently:
+      * `preprocess_s` / `setup_s` -- wall-clock measured by the caller.
+      * `_SR_WALL_PHASES` -- wall-clock measured inside the planner (the
+        initial-pose precheck). Carved out of the planner window first, so it
+        is never diluted by the parallel scaling below.
+      * `_SR_PARALLEL_COMPONENTS` -- worker-side CPU-seconds. With num_proc > 1
+        these sum to more than the window they ran in, so they are scaled
+        proportionally to fit it; when they sum to less, the remainder becomes
+        `search_overhead`.
+
+    Returns (wall_breakdown, cpu_total_s, parallel_factor).
+    """
+    planner_s = max(0.0, float(planner_s))
+    wall = dict.fromkeys(_SR_COMPONENTS, 0.0)
+    wall["preprocess"] = max(0.0, float(preprocess_s or 0.0))
+    wall["setup"] = max(0.0, float(setup_s))
+
+    phase_total = 0.0
+    for k in _SR_WALL_PHASES:
+        v = max(0.0, float(cpu_breakdown.get(k, 0.0) or 0.0))
+        wall[k] = v
+        phase_total += v
+    # The precheck can't exceed the planner's own wall-clock; clamp so a
+    # rounding mismatch can't drive the parallel window negative.
+    phase_total = min(phase_total, planner_s)
+    window = max(0.0, planner_s - phase_total)
+
+    cpu = {k: float(cpu_breakdown.get(k, 0.0) or 0.0) for k in _SR_PARALLEL_COMPONENTS}
+    cpu_total = sum(cpu.values())
+    if cpu_total > window and cpu_total > 0.0:
+        scale = window / cpu_total
+        for k, v in cpu.items():
+            wall[k] = v * scale
+        wall["search_overhead"] = 0.0
+    else:
+        for k, v in cpu.items():
+            wall[k] = v
+        wall["search_overhead"] = window - cpu_total
+    parallel_factor = (cpu_total / window) if window > 0 else 0.0
+    return wall, cpu_total, parallel_factor
+
+
+def run_data_sequence_runtime(args, test_eval, output_folder, assembly_dir):
+    # ------------------------------------------------------------------
+    # Sequence-finder runtime benchmark (compute time, not robot time).
+    #
+    # Plans every assembly once with the heuristic planner under the
+    # Optuna-trained weights and with the divide optimizer disabled (no
+    # subassembly splitting), under the same conditions as the
+    # assets/results/timing_final benchmark: planner=heuristic,
+    # generator=rand, --plan-arm on, rendering off, cold cache per
+    # assembly. (--plan-arm is forced on for parity with that benchmark
+    # even though the parallel DFA path does not enforce arm feasibility
+    # during the search itself -- see the note in DFASequencePlanner.plan.)
+    #
+    # NOTE (environment): pyvista/VTK opens an X connection in the parent
+    # when the precheck renders its candidate-pose PNGs, immediately before
+    # parallel_execute forks. Parent and children then share that socket and
+    # the workers deadlock in poll(). If the run stalls at
+    # "initial stable pose check: 0%", run with DISPLAY unset and
+    # PYVISTA_OFF_SCREEN=true so VTK never opens an on-screen context.
+    #
+    # Records, per assembly: total wall-clock, the planner's internal
+    # timing buckets, and the search statistics; then emits
+    #   - parts_vs_runtime.{png,pdf}            (the headline graph)
+    #   - parts_vs_runtime_breakdown.{png,pdf}  (mean stack per size)
+    #   - runtime_per_assembly.{png,pdf}        (stack per assembly)
+    #   - sequence_runtime_summary.{json,txt}
+    # Assemblies are processed in the order main.py resolved them, which
+    # --balance-parts / --sort-by-parts makes ascending by part count.
+    # ------------------------------------------------------------------
+    sr_dir = Path(output_folder) / "sequence_runtime"
+    sr_dir.mkdir(parents=True, exist_ok=True)
+
+    # records[assembly_id] = per-assembly result dict, keyed and shaped as
+    # built in the planning loop below (id, n_parts, status, timings).
+    records = {}
+
+    def _write_summary():
+        if not records:
+            return
+        ordered = sorted(
+            records.values(), key=lambda r: (r.get("n_parts", 0), r.get("id", ""))
+        )
+        summary = {
+            "conditions": {
+                "planner": "heuristic",
+                "generator": "rand",
+                "heuristic_weights_source": "optuna",
+                "heuristic_weights_path": getattr(
+                    settings, "heuristic_weights_optuna_path", None
+                ),
+                "seq_optimizer": None,
+                "plan_arm": True,
+                "render_sequence": False,
+                "assembly_dir": str(assembly_dir),
+                "num_proc": getattr(args, "num_proc", None),
+                "budget": getattr(args, "budget", None),
+                "max_gripper": getattr(args, "max_gripper", None),
+                "seed": getattr(args, "seed", None),
+                "gripper_type": getattr(args, "gripper_type", None),
+                "gripper_scale": getattr(args, "gripper_scale", None),
+            },
+            "components": list(_SR_COMPONENTS),
+            "per_assembly": ordered,
+        }
+        json_path = sr_dir / "sequence_runtime_summary.json"
+        with open(json_path, "w") as _f:
+            json.dump(summary, _f, indent=2, default=str)
+
+        ok = [r for r in ordered if r.get("status") == "ok"]
+        lines = []
+        lines.append("Sequence-Finder Runtime vs Assembly Size")
+        lines.append("=" * 96)
+        lines.append(
+            f"Assemblies: {len(ordered)} ({len(ok)} planned successfully)  "
+            f"dir={assembly_dir}"
+        )
+        lines.append(
+            "Conditions: planner=heuristic (Optuna-trained weights), "
+            "generator=rand, no subassembly splitting, --plan-arm on, render off"
+        )
+        lines.append("")
+        lines.append(
+            f"  {'id':>6}  {'parts':>5}  {'status':>10}  {'wall_s':>9}  "
+            f"{'planner_s':>9}  {'setup_s':>8}  {'n_eval':>7}  {'steps':>5}  {'par':>5}"
+        )
+        for r in ordered:
+            lines.append(
+                f"  {r['id']:>6}  {r.get('n_parts', 0):>5}  "
+                f"{r.get('status', '?'):>10}  {r.get('wall_s', 0.0):>9.2f}  "
+                f"{r.get('planner_s', 0.0):>9.2f}  {r.get('setup_s', 0.0):>8.2f}  "
+                f"{r.get('n_eval') or 0:>7}  {r.get('n_steps') or 0:>5}  "
+                f"{r.get('parallel_factor', 0.0):>5.1f}"
+            )
+        lines.append("")
+        lines.append("Mean wall-clock per part count (successful runs only):")
+        lines.append(f"  {'parts':>5}  {'n':>3}  {'mean_s':>9}  {'std_s':>9}")
+        by_size = {}
+        for r in ok:
+            by_size.setdefault(r["n_parts"], []).append(float(r["wall_s"]))
+        for n in sorted(by_size):
+            vals = by_size[n]
+            mean_v = sum(vals) / len(vals)
+            std_v = (sum((v - mean_v) ** 2 for v in vals) / len(vals)) ** 0.5
+            lines.append(f"  {n:>5}  {len(vals):>3}  {mean_v:>9.2f}  {std_v:>9.2f}")
+        lines.append("")
+        comps, _collapse, _mixed = _sr_components_for(ok)
+        lines.append("Time breakdown across all successful runs:")
+        if _mixed:
+            lines.append(
+                "  (mixed instrumentation: some runs predate the sim_build/dof "
+                "split, so those are folded back into path finding)"
+            )
+        agg = dict.fromkeys(comps, 0.0)
+        for r in ok:
+            wb = _collapse(r.get("wall_breakdown") or {})
+            for c in comps:
+                agg[c] += wb.get(c, 0.0)
+        grand = sum(agg.values()) or 1.0
+        lines.append(f"  {'component':<22}  {'total_s':>10}  {'share':>7}")
+        for c in comps:
+            lines.append(
+                f"  {_SR_LABELS[c]:<22}  {agg[c]:>10.2f}  {100 * agg[c] / grand:>6.1f}%"
+            )
+        lines.append(f"  {'TOTAL':<22}  {grand:>10.2f}")
+
+        conc = [
+            r["part_time_concentration"] for r in ok if r.get("part_time_concentration")
+        ]
+        if conc:
+            lines.append("")
+            lines.append(
+                "Per-part simulation cost concentration "
+                f"({len(conc)} runs with per-part timing):"
+            )
+            lines.append(
+                "  How unevenly sim time spreads over the parts a run tried to remove."
+            )
+            lines.append(f"  {'metric':<26}  {'median':>8}  {'min':>8}  {'max':>8}")
+
+            def _q(key, scale=1.0):
+                v = sorted(c[key] * scale for c in conc if c.get(key) is not None)
+                if not v:
+                    return None
+                m = len(v) // 2
+                med = v[m] if len(v) % 2 else (v[m - 1] + v[m]) / 2.0
+                return med, v[0], v[-1]
+
+            for key, label, scale in (
+                ("top_share", "largest part's share %", 100.0),
+                ("top3_share", "top-3 parts' share %", 100.0),
+                ("max_over_median", "max / median part", 1.0),
+            ):
+                q = _q(key, scale)
+                if q:
+                    lines.append(
+                        f"  {label:<26}  {q[0]:>8.2f}  {q[1]:>8.2f}  {q[2]:>8.2f}"
+                    )
+        txt_path = sr_dir / "sequence_runtime_summary.txt"
+        with open(txt_path, "w") as _f:
+            _f.write("\n".join(lines) + "\n")
+        print(f"[seq-runtime] summary -> {json_path}")
+        print(f"[seq-runtime] summary -> {txt_path}")
+
+        _plot_summary(ordered, ok, by_size)
+
+    def _save(fig, stem):
+        for ext in ("png", "pdf"):
+            out = sr_dir / f"{stem}.{ext}"
+            fig.savefig(out, dpi=140)
+        plt.close(fig)
+        print(f"[seq-runtime] {stem}.png / {stem}.pdf")
+
+    def _plot_summary(ordered, ok, by_size):
+        comps, _collapse, _ = _sr_components_for(ok)
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+
+            # 1) Headline graph: number of parts vs runtime.
+            fig, ax = plt.subplots(figsize=(7.5, 4.8))
+            if ok:
+                ax.scatter(
+                    [r["n_parts"] for r in ok],
+                    [r["wall_s"] for r in ok],
+                    s=28,
+                    color="#4C72B0",
+                    alpha=0.75,
+                    label="assembly",
+                    zorder=3,
+                )
+            if by_size:
+                sizes = sorted(by_size)
+                means = np.array([np.mean(by_size[n]) for n in sizes])
+                stds = np.array(
+                    [np.std(by_size[n]) if len(by_size[n]) > 1 else 0.0 for n in sizes]
+                )
+                ax.plot(sizes, means, color="#C44E52", lw=2, label="mean", zorder=4)
+                ax.fill_between(
+                    sizes,
+                    np.maximum(means - stds, 0.0),
+                    means + stds,
+                    color="#C44E52",
+                    alpha=0.15,
+                    zorder=2,
+                )
+            # Runs stopped by a limit, drawn distinctly: their wall-clock is a
+            # lower bound (the search was cut off), so they must not read as
+            # ordinary measurements.
+            capped = [(r, _sr_cap_kind(r)) for r in ordered]
+            capped = [(r, k) for r, k in capped if k and r.get("wall_s")]
+            for kind, marker, colour, label in (
+                ("budget", "X", "#C44E52", "hit eval budget (incomplete)"),
+                ("timeout", "s", "#8172B2", "hit watchdog timeout (incomplete)"),
+            ):
+                pts = [r for r, k in capped if k == kind]
+                if not pts:
+                    continue
+                ax.scatter(
+                    [r["n_parts"] for r in pts],
+                    [r["wall_s"] for r in pts],
+                    s=90,
+                    marker=marker,
+                    facecolors="none" if marker == "s" else colour,
+                    edgecolors=colour,
+                    linewidths=1.8,
+                    label=label,
+                    zorder=5,
+                )
+                for r in pts:
+                    ax.annotate(
+                        f"{r['id']}\n{r.get('n_steps', 0)}/{r['n_parts'] - 1} steps",
+                        (r["n_parts"], r["wall_s"]),
+                        textcoords="offset points",
+                        xytext=(7, -4),
+                        fontsize=6.5,
+                        color=colour,
+                    )
+            ax.set_xlabel("number of parts")
+            ax.set_ylabel("sequence-planning runtime (s)")
+            ax.set_title(
+                "Sequence-finder runtime vs assembly size\n"
+                "(mean over completed runs; capped runs shown but excluded)",
+                fontsize=11,
+            )
+            ax.grid(alpha=0.3)
+            ax.legend(fontsize=8)
+            fig.tight_layout()
+            _save(fig, "parts_vs_runtime")
+
+            # 2) Mean time breakdown per part count.
+            if by_size:
+                sizes = sorted(by_size)
+                fig, ax = plt.subplots(figsize=(max(7.0, 0.5 * len(sizes) + 3), 4.8))
+                x = np.arange(len(sizes))
+                bottom = np.zeros(len(sizes))
+                by_size_recs = {}
+                for r in ok:
+                    by_size_recs.setdefault(r["n_parts"], []).append(r)
+                for comp in comps:
+                    vals = np.array(
+                        [
+                            float(
+                                np.mean(
+                                    [
+                                        _collapse(rr.get("wall_breakdown") or {}).get(
+                                            comp, 0.0
+                                        )
+                                        for rr in by_size_recs[n]
+                                    ]
+                                )
+                            )
+                            for n in sizes
+                        ]
+                    )
+                    ax.bar(
+                        x,
+                        vals,
+                        bottom=bottom,
+                        color=_SR_COLORS[comp],
+                        label=_SR_LABELS[comp],
+                    )
+                    bottom += vals
+                ax.set_xticks(x)
+                ax.set_xticklabels([str(n) for n in sizes])
+                ax.set_xlabel("number of parts")
+                ax.set_ylabel("mean runtime (s)")
+                ax.set_title("Where the sequence-planning time goes, by assembly size")
+                ax.legend(fontsize=8)
+                ax.grid(axis="y", alpha=0.3)
+                fig.tight_layout()
+                _save(fig, "parts_vs_runtime_breakdown")
+
+            # 3) Per-assembly stacked breakdown, ascending by part count.
+            # Only completed runs reach the charts -- an aborted plan's
+            # wall-clock measures how fast it gave up, not how long the search
+            # takes, so mixing them in would bias every summary downward.
+            plotted = list(ok)
+            if plotted:
+                fig, ax = plt.subplots(figsize=(max(8.0, 0.32 * len(plotted) + 3), 5.0))
+                x = np.arange(len(plotted))
+                bottom = np.zeros(len(plotted))
+                for comp in comps:
+                    vals = np.array(
+                        [
+                            _collapse(r.get("wall_breakdown") or {}).get(comp, 0.0)
+                            for r in plotted
+                        ]
+                    )
+                    ax.bar(
+                        x,
+                        vals,
+                        bottom=bottom,
+                        color=_SR_COLORS[comp],
+                        label=_SR_LABELS[comp],
+                    )
+                    bottom += vals
+                ax.set_xticks(x)
+                ax.set_xticklabels(
+                    [f"{r['id']}\n({r['n_parts']}p)" for r in plotted],
+                    rotation=90,
+                    fontsize=6,
+                )
+                ax.set_ylabel("runtime (s)")
+                ax.set_title(
+                    "Per-assembly sequence-planning runtime (ascending by part count)"
+                )
+                ax.legend(fontsize=8)
+                ax.grid(axis="y", alpha=0.3)
+                fig.tight_layout()
+                _save(fig, "runtime_per_assembly")
+        except (Exception, KeyboardInterrupt) as _plot_e:
+            # Never lose the JSON/TXT already written above to a plotting
+            # failure; re-raise interrupts so the outer finally still sees them.
+            print(f"[seq-runtime] plotting failed: {_plot_e}")
+            if isinstance(_plot_e, KeyboardInterrupt):
+                raise
+            import traceback as _tb
+
+            _tb.print_exc()
+
+    def _run_assembly(ass, preprocess_s=0.0):
+        """Plan one assembly cold, record its timing, return the record.
+
+        `preprocess_s` is the wall-clock spent constructing the Assembly
+        (mesh prep, convex decomposition). It is 0 for assemblies main.py
+        created up front, whose preprocessing happened before this handler
+        was entered and cannot be attributed per assembly.
+        """
+        n_parts = len(ass.objects)
+        print(f"\n[seq-runtime] ===== assembly {ass.id} ({n_parts} parts) =====")
+        record = {
+            "id": ass.id,
+            "n_parts": n_parts,
+            "status": "error",
+            "preprocess_s": round(float(preprocess_s or 0.0), 3),
+        }
+        records[ass.id] = record
+
+        # Fresh per-assembly run dir so every run is a cold plan — a
+        # cached sequence.json / tree.pkl would make the timing meaningless.
+        run_dir = sr_dir / str(ass.id)
+        if run_dir.exists():
+            shutil.rmtree(str(run_dir))
+        run_dir.mkdir(parents=True, exist_ok=True)
+        record["run_dir"] = str(run_dir)
+
+        _orig_ass_storage = ass.storage_dir
+        ass.storage_dir = run_dir
+        t0 = time.perf_counter()
+        # Watchdog. The parallel search has repeatedly deadlocked on pathological
+        # assemblies (parent blocked in queue.get(), workers idle), which costs
+        # the whole batch hours of nothing. SIGALRM interrupts the blocking read
+        # so one bad assembly is abandoned instead of stalling the run. 0/None
+        # disables it. settings.seq_runtime_assembly_timeout_s is the knob.
+        _timeout_s = _sr_timeout_for(n_parts)
+        _prev_handler = None
+        if _timeout_s > 0 and hasattr(signal, "SIGALRM"):
+
+            def _on_timeout(_signum, _frame):
+                raise TimeoutError(
+                    f"assembly exceeded seq_runtime_assembly_timeout_s={_timeout_s}s"
+                )
+
+            _prev_handler = signal.signal(signal.SIGALRM, _on_timeout)
+            signal.alarm(_timeout_s)
+        try:
+            ass.planner.get_assembly_plans(args)
+            plan_error = None
+        except TimeoutError as _texc:
+            plan_error = str(_texc)
+            print(f"[seq-runtime]    TIMEOUT: {plan_error}; abandoning this assembly")
+            _sr_kill_orphan_workers()
+        except Exception as _exc:
+            import traceback as _tb
+
+            _tb.print_exc()
+            plan_error = str(_exc)
+        finally:
+            if _prev_handler is not None:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, _prev_handler)
+        wall_s = time.perf_counter() - t0
+        ass.storage_dir = _orig_ass_storage
+        record["wall_s"] = round(wall_s, 3)
+
+        stats_path = run_dir / "log" / "stats.json"
+        stats = None
+        if stats_path.exists():
+            try:
+                with open(stats_path) as _f:
+                    stats = json.load(_f)
+            except Exception as _e:
+                print(f"[seq-runtime]    unreadable stats.json: {_e}")
+
+        if stats is None:
+            record["error"] = plan_error or "planner produced no stats.json"
+            record["wall_breakdown"] = dict.fromkeys(_SR_COMPONENTS, 0.0)
+            record["wall_breakdown"]["setup"] = round(wall_s, 3)
+            record["wall_breakdown"]["preprocess"] = round(
+                float(preprocess_s or 0.0), 3
+            )
+            print(f"[seq-runtime]    failed after {wall_s:.2f}s: {record['error']}")
+            _write_summary()
+            return record
+
+        planner_s = float(stats.get("time", 0.0) or 0.0)
+        cpu_breakdown = stats.get("timing_breakdown") or {}
+        wall_breakdown, cpu_total, parallel_factor = _sr_attribute_wall_time(
+            planner_s, wall_s - planner_s, cpu_breakdown, preprocess_s=preprocess_s
+        )
+        sequence = stats.get("sequence") or []
+        record.update(
+            {
+                "planner_s": round(planner_s, 3),
+                "setup_s": round(max(0.0, wall_s - planner_s), 3),
+                "cpu_breakdown": {k: float(v) for k, v in cpu_breakdown.items()},
+                "cpu_counts": stats.get("timing_counts") or {},
+                "cpu_total_s": round(cpu_total, 3),
+                "parallel_factor": round(parallel_factor, 3),
+                "wall_breakdown": {k: round(v, 3) for k, v in wall_breakdown.items()},
+                "timing_by_part": stats.get("timing_by_part") or {},
+                "timing_by_part_counts": stats.get("timing_by_part_counts") or {},
+                "part_time_concentration": _sr_part_concentration(
+                    stats.get("timing_by_part") or {}
+                ),
+                "n_eval": stats.get("n_eval"),
+                "total_n_eval": stats.get("total_n_eval"),
+                "n_gripper": stats.get("n_gripper"),
+                "n_steps": len(sequence),
+                "success": bool(stats.get("success", False)),
+                "partial": bool(stats.get("partial", False)),
+                "stop_msg": stats.get("stop_msg"),
+            }
+        )
+        if plan_error is not None:
+            record["status"] = "error"
+            record["error"] = plan_error
+        elif stats.get("success"):
+            record["status"] = "ok"
+        elif stats.get("stop_msg") == "no self-stable initial pose":
+            record["status"] = "no_stable_pose"
+        elif sequence:
+            record["status"] = "partial"
+        else:
+            record["status"] = "no_sequence"
+
+        top = sorted(
+            ((k, v) for k, v in wall_breakdown.items() if v > 0),
+            key=lambda kv: -kv[1],
+        )[:3]
+        print(
+            f"[seq-runtime]    {record['status']}: wall={wall_s:.2f}s "
+            f"(planner={planner_s:.2f}s, setup={record['setup_s']:.2f}s, "
+            f"n_eval={record['total_n_eval']}, steps={record['n_steps']}, "
+            f"parallel={parallel_factor:.1f}x)  top: "
+            + ", ".join(f"{_SR_LABELS[k]} {v:.1f}s" for k, v in top)
+        )
+        # Incremental save so an abort keeps every completed assembly.
+        _write_summary()
+
+        return record
+
+    # Data-dir-first: re-plot an earlier run's summary instead of re-planning.
+    data_dir = getattr(args, "data_dir", None)
+    if data_dir:
+        src = Path(data_dir)
+        candidates = [
+            src / "sequence_runtime_summary.json",
+            src / "sequence_runtime" / "sequence_runtime_summary.json",
+            src,
+        ]
+        found = next((p for p in candidates if p.is_file()), None)
+        if found is not None:
+            with open(found) as _f:
+                prev = json.load(_f)
+            for rec in prev.get("per_assembly", []):
+                records[rec["id"]] = rec
+            if getattr(args, "resume", False):
+                n_ok = sum(1 for r in records.values() if r.get("status") == "ok")
+                print(
+                    f"[seq-runtime] resuming from {found}: {len(records)} assemblies "
+                    f"carried over ({n_ok} completed); planning only what is missing"
+                )
+            else:
+                print(
+                    f"[seq-runtime] re-plotting from {found} "
+                    f"({len(records)} assemblies); skipping planning"
+                )
+                _write_summary()
+                return
+        print(
+            f"[seq-runtime] --data-dir given ({data_dir}) but no "
+            f"sequence_runtime_summary.json found there; running the benchmark"
+        )
+
+    _orig_planner = getattr(args, "planner", None)
+    _orig_generator = getattr(args, "generator", None)
+    _orig_seq_optimizer = getattr(args, "seq_optimizer", None)
+    _orig_plan_arm = getattr(args, "plan_arm", False)
+    _orig_render = settings.render_sequence
+    _orig_debug_stability = getattr(settings, "debug_stability", False)
+    _orig_hw_source = getattr(settings, "heuristic_weights_source", "default")
+
+    try:
+        args.planner = "heuristic"
+        args.generator = "rand"
+        # No subassembly splitting: the divide optimizer stays off, so the
+        # measured time is pure sequence search.
+        args.seq_optimizer = None
+        if not _orig_plan_arm:
+            print(
+                "[seq-runtime] --plan-arm was off; forcing it ON to match the "
+                "conditions logged under assets/results/timing_final"
+            )
+        args.plan_arm = True
+        # Rendering is a separate cost and would dominate the measurement.
+        settings.render_sequence = False
+        # The gravity precheck's per-pose stability GIFs are a diagnostic
+        # artifact, not a planning condition, and they land inside the
+        # measured window. Off for the benchmark's duration, restored in the
+        # finally below. (Unrelated to the X-fork deadlock noted in the
+        # docstring -- that one is an environment issue, not a settings one.)
+        if _orig_debug_stability:
+            print(
+                "[seq-runtime] settings.debug_stability was on; disabling it "
+                "for this run (precheck stability GIFs would land inside the "
+                "measured runtime)"
+            )
+        settings.debug_stability = False
+        settings.heuristic_weights_source = "optuna"
+        weights_path = Path(
+            getattr(
+                settings,
+                "heuristic_weights_optuna_path",
+                "assets/heuristic_weights_optuna.json",
+            )
+        )
+        if weights_path.exists():
+            # Echo the weights the planner will actually load, so a run's log
+            # proves which weight set produced its numbers.
+            try:
+                with open(weights_path) as _wf:
+                    _w = json.load(_wf)
+                print(
+                    f"[seq-runtime] trained weights from {weights_path}: "
+                    + ", ".join(f"{k}={float(v):.4f}" for k, v in _w.items())
+                )
+            except (OSError, ValueError) as _we:
+                print(f"[seq-runtime] WARN: could not read {weights_path}: {_we}")
+        else:
+            print(
+                f"[seq-runtime] WARN: trained weights {weights_path} missing; "
+                f"the heuristic planner will fall back to settings.heuristic_weights"
+            )
+
+        target = getattr(args, "balance_parts", None)
+        by_id = {a.id: a for a in test_eval.assemblies}
+
+        if target:
+            # Search for `target` FEASIBLE assemblies per size rather than
+            # testing a fixed `target`: draw further candidates from the pool
+            # whenever one fails, so every size gets a full complement of
+            # finished runs where the data allows it.
+            pool = candidates_by_part_count(
+                args.id,
+                assembly_dir,
+                max_parts=getattr(args, "max_parts", None),
+                min_parts=getattr(args, "min_parts", None),
+            )
+            n_cand = sum(len(v) for v in pool.values())
+            print(
+                f"[seq-runtime] searching for {target} feasible assemblies per part "
+                f"count, drawing from {n_cand} candidates across {len(pool)} sizes "
+                f"(ascending)"
+            )
+            for n_parts in sorted(pool):
+                # Successes carried over from a resumed run already count.
+                found = sum(
+                    1
+                    for r in records.values()
+                    if r.get("status") == "ok" and r.get("n_parts") == n_parts
+                )
+                tried = 0
+                if found:
+                    print(
+                        f"[seq-runtime] {n_parts} parts: {found} completed run(s) "
+                        f"carried over"
+                    )
+                for aid in pool[n_parts]:
+                    if found >= target:
+                        break
+                    # Don't repeat an assembly a resumed run already settled --
+                    # neither its successes (counted above) nor its rejections.
+                    if aid in records:
+                        continue
+                    ass = by_id.get(aid)
+                    pre_s = 0.0
+                    if ass is None:
+                        _t_pre = time.perf_counter()
+                        test_eval.add_assembly(
+                            dir=assembly_dir, id=aid, storage_dir=None
+                        )
+                        pre_s = time.perf_counter() - _t_pre
+                        ass = test_eval.assemblies[-1]
+                        by_id[aid] = ass
+                    tried += 1
+                    if _run_assembly(ass, preprocess_s=pre_s).get("status") == "ok":
+                        found += 1
+                note = "" if found >= target else "  (pool exhausted)"
+                print(
+                    f"[seq-runtime] == {n_parts} parts: {found}/{target} feasible "
+                    f"after {tried} candidate(s){note} =="
+                )
+        else:
+            for ass in test_eval.assemblies:
+                _run_assembly(ass)
+
+    finally:
+        if _orig_planner is not None:
+            args.planner = _orig_planner
+        if _orig_generator is not None:
+            args.generator = _orig_generator
+        args.seq_optimizer = _orig_seq_optimizer
+        args.plan_arm = _orig_plan_arm
+        settings.render_sequence = _orig_render
+        settings.debug_stability = _orig_debug_stability
+        settings.heuristic_weights_source = _orig_hw_source
+        try:
+            _write_summary()
+        except Exception as _e:
+            print(f"[seq-runtime] failed to write summary: {_e}")
 
 
 def run_data_manual_validation(args, test_eval, output_folder, assembly_dir):

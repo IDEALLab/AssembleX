@@ -20,6 +20,7 @@ from run_data import (
     run_data_filter_assemblies,
     run_data_heuristic_validation,
     run_data_manual_validation,
+    run_data_sequence_runtime,
     run_data_validate_cost,
     run_test_convex_decomp,
     run_test_tool_needed,
@@ -54,6 +55,7 @@ DISPATCH = {
     "test_render": run_test_render,
     # Data generation
     "data_assembly_time": run_data_assembly_time,
+    "data_sequence_runtime": run_data_sequence_runtime,
     "train_heuristic_weights": run_train_heuristic_weights,
     "data_heuristic_validation": run_data_heuristic_validation,
     "data_manual_validation": run_data_manual_validation,
@@ -246,6 +248,47 @@ if __name__ == "__main__":
         help="minimum number of parts in included assemblies (only for --id ranges)",
     )
     parser.add_argument(
+        "--balance-parts",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "keep at most N assemblies per distinct part count, so every assembly "
+            "size in the --id range is equally represented (sizes with fewer than N "
+            "available contribute all they have). Implies --sort-by-parts. Only for "
+            "--id ranges; combine with --min-parts/--max-parts to bound the sizes."
+        ),
+    )
+    parser.add_argument(
+        "--exclude-ids",
+        type=str,
+        default=None,
+        metavar="IDS",
+        help=(
+            "comma-separated assembly ids to hold out of --id selection (e.g. a "
+            "training split, so a later test run draws a disjoint set). Applied "
+            "before --balance-parts, which then tops each size up from what is left."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "data_sequence_runtime: load a previous run's results from --data-dir "
+            "and continue it instead of re-plotting. Completed assemblies are kept "
+            "and count toward --balance-parts, so only the missing ones are planned. "
+            "The merged summary is written to the new output directory."
+        ),
+    )
+    parser.add_argument(
+        "--sort-by-parts",
+        action="store_true",
+        help=(
+            "process assemblies in ascending order of part count instead of by id "
+            "(ties broken by id). Only for --id ranges."
+        ),
+    )
+    parser.add_argument(
         "--budget",
         type=int,
         default=6000,
@@ -338,9 +381,22 @@ if __name__ == "__main__":
     )
     assembly_dir = os.path.join("assets", args.dir)
     _storage_dir = args.storage_dir or None
+    _excluded_ids = (
+        [x.strip() for x in args.exclude_ids.split(",") if x.strip()]
+        if args.exclude_ids
+        else None
+    )
+    if _excluded_ids:
+        print(f"Holding out {len(_excluded_ids)} assembly id(s): {_excluded_ids}")
     if args.id is not None:
         for _id in resolve_ids(
-            args.id, assembly_dir, max_parts=args.max_parts, min_parts=args.min_parts
+            args.id,
+            assembly_dir,
+            max_parts=args.max_parts,
+            min_parts=args.min_parts,
+            balance_parts=args.balance_parts,
+            sort_by_parts=args.sort_by_parts,
+            exclude_ids=_excluded_ids,
         ):
             test_eval.add_assembly(dir=assembly_dir, id=_id, storage_dir=_storage_dir)
     print(

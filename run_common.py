@@ -14,36 +14,97 @@ def create_output_directory():
     return output_path
 
 
-def resolve_ids(id_arg, dir_arg, max_parts=None, min_parts=None):
+def resolve_ids(
+    id_arg,
+    dir_arg,
+    max_parts=None,
+    min_parts=None,
+    balance_parts=None,
+    sort_by_parts=False,
+    exclude_ids=None,
+):
     """Return a list of assembly IDs to process.
 
     Accepts either a single ID ("00042") or an inclusive range ("00010-00050").
     For ranges, only IDs that exist as subdirectories of dir_arg are returned.
     Optional `min_parts` / `max_parts` filters drop IDs whose `.obj` count
-    falls outside [min_parts, max_parts]. Filters only apply in the range case.
+    falls outside [min_parts, max_parts]. `balance_parts=N` then keeps at most
+    N IDs per distinct part count, so every assembly size is represented by
+    the same number of assemblies (sizes with fewer than N available
+    contribute all they have). `sort_by_parts` — implied by `balance_parts` —
+    orders the result by ascending part count instead of by ID, with the ID as
+    tie-breaker. Filters, balancing and ordering only apply in the range case.
     """
-    if "-" in id_arg:
-        start, end = id_arg.split("-", 1)
-        width = max(len(start), len(end))
-        in_range = {str(i).zfill(width) for i in range(int(start), int(end) + 1)}
-        existing = {
-            d for d in os.listdir(dir_arg) if os.path.isdir(os.path.join(dir_arg, d))
-        }
-        if max_parts is not None or min_parts is not None:
+    if "-" not in id_arg:
+        return [id_arg]
 
-            def _n_parts(d):
-                full = os.path.join(dir_arg, d)
-                return sum(1 for f in os.listdir(full) if f.endswith(".obj"))
+    start, end = id_arg.split("-", 1)
+    width = max(len(start), len(end))
+    in_range = {str(i).zfill(width) for i in range(int(start), int(end) + 1)}
+    existing = {
+        d for d in os.listdir(dir_arg) if os.path.isdir(os.path.join(dir_arg, d))
+    }
+    ids = sorted(in_range & existing)
+    if exclude_ids:
+        # Held-out IDs (e.g. a training split) are removed before balancing, so
+        # `balance_parts` tops each size back up from the remaining pool rather
+        # than returning short.
+        ids = [d for d in ids if d not in set(exclude_ids)]
 
-            def _ok(d):
-                n = _n_parts(d)
-                if max_parts is not None and n > max_parts:
-                    return False
-                return not (min_parts is not None and n < min_parts)
+    if (
+        max_parts is None
+        and min_parts is None
+        and balance_parts is None
+        and not sort_by_parts
+    ):
+        return ids
 
-            existing = {d for d in existing if _ok(d)}
-        return sorted(in_range & existing)
-    return [id_arg]
+    def _n_parts(d):
+        full = os.path.join(dir_arg, d)
+        return sum(1 for f in os.listdir(full) if f.endswith(".obj"))
+
+    counted = [(d, _n_parts(d)) for d in ids]
+    if max_parts is not None:
+        counted = [(d, n) for d, n in counted if n <= max_parts]
+    if min_parts is not None:
+        counted = [(d, n) for d, n in counted if n >= min_parts]
+
+    if balance_parts is not None:
+        # `counted` is ID-sorted here, so the per-size pick is deterministic.
+        per_size = {}
+        for entry in counted:
+            per_size.setdefault(entry[1], []).append(entry)
+        counted = [e for n in sorted(per_size) for e in per_size[n][:balance_parts]]
+
+    if sort_by_parts or balance_parts is not None:
+        counted.sort(key=lambda e: (e[1], e[0]))
+        return [d for d, _ in counted]
+    return sorted(d for d, _ in counted)
+
+
+def candidates_by_part_count(
+    id_arg, dir_arg, max_parts=None, min_parts=None, exclude_ids=None
+):
+    """Group every candidate assembly in range by its part count.
+
+    Returns {n_parts: [id, ...]} with both the sizes and each size's ID list in
+    ascending order. Unlike `resolve_ids(..., balance_parts=N)`, which commits
+    to the first N per size up front, this exposes the whole pool so a caller
+    can keep drawing replacements until N assemblies actually succeed.
+    """
+    ids = resolve_ids(
+        id_arg,
+        dir_arg,
+        max_parts=max_parts,
+        min_parts=min_parts,
+        exclude_ids=exclude_ids,
+    )
+    groups = {}
+    for d in ids:
+        full = os.path.join(dir_arg, d)
+        n = sum(1 for f in os.listdir(full) if f.endswith(".obj"))
+        groups.setdefault(n, []).append(d)
+    return {n: sorted(groups[n]) for n in sorted(groups)}
 
 
 def _write_comparison_batch_summary(assemblies, output_folder):

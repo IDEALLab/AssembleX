@@ -49,6 +49,20 @@ by purpose:
   - `train_heuristic_weights` — Optuna study that tunes
     `HeuristicDFASequencePlanner` weights against arm-pipeline `total_s`. Writes
     `assets/heuristic_weights_optuna.json` + history.
+  - `data_sequence_runtime` — sequence-finder **compute**-time benchmark
+    (as opposed to `data_assembly_time`, which measures predicted *robot*
+    time). Plans each assembly once with the heuristic planner under the
+    Optuna-trained weights, divide optimizer off, `--plan-arm` forced on and
+    rendering off — the same conditions as `assets/results/timing_final` —
+    into a fresh per-assembly dir so every run is a cold plan. Records
+    wall-clock plus the planner's own timing buckets and emits
+    `parts_vs_runtime`, `parts_vs_runtime_breakdown`, `runtime_per_assembly`
+    (PNG + PDF) and `sequence_runtime_summary.{json,txt}`. `--data-dir`
+    pointing at an earlier run's summary re-plots without re-planning.
+    With `--balance-parts N` it searches for N *feasible* assemblies per part
+    count (drawing further candidates from the pool whenever one fails) rather
+    than testing a fixed N, and only completed runs reach the charts -- an
+    aborted plan's wall-clock measures how fast it gave up, not search cost.
   - `data_heuristic_validation`, `data_manual_validation`, `data_validate_cost`
     — offline eval batches.
   - `data_filter_assemblies` — interactive triage that displays an iso render +
@@ -70,7 +84,13 @@ by purpose:
     `test_archive_ASAP` — visual checks and baseline runs.
 
 Shared CLI helpers (`resolve_ids`, `create_output_directory`, the batch-summary
-writers) live in **[run_common.py](run_common.py)**.
+writers) live in **[run_common.py](run_common.py)**. `resolve_ids` also does
+the size-based selection for range IDs: `--min-parts` / `--max-parts` bound the
+part count, `--balance-parts N` then keeps at most N assemblies per distinct
+part count (equal representation per size), and `--sort-by-parts` (implied by
+`--balance-parts`) orders the batch by ascending part count instead of by ID.
+`candidates_by_part_count` exposes the *whole* pool grouped by size, for
+callers that need to keep drawing replacements until N assemblies succeed.
 
 Every subcommand resolves the assembly IDs via `resolve_ids(args.id, dir)`
 (supports `"00010-00050"` range strings) and instantiates a shared `Eval`
@@ -173,6 +193,8 @@ storage_dir/
 ├── log/
 │   ├── tree.pkl              # the planning DiGraph
 │   ├── stats.json            # success, sequence, divide_split, timings, cli_args
+│                             # + timing_breakdown / timing_counts (planner's
+│                             #   per-check buckets; worker CPU-seconds)
 │   ├── setup.json            # the planner kwargs
 │   ├── arm_plans.json        # arm pipeline (when --plan-arm or arm_continuous)
 │   ├── timing_overview.json  # per-step + totals timing breakdown (arm pipeline)
@@ -181,6 +203,7 @@ storage_dir/
 ├── 0_<obj>.gif, …            # primary-view per-step disassembly GIFs
 ├── 0_<obj>_opposite.gif      # opposite-view per-step GIFs
 ├── subassembly/              # divide-optimizer renders (split.gif + S_*/R_* internals)
+├── sequence_runtime/         # data_sequence_runtime (in the run's output dir)
 ├── obstruction_graph.png     # test_divide_optimizer diagnostic
 ├── subassemblies/            # test_divide_optimizer per-partition screenshots
 └── assembly_time/<run>/      # per-RUN cache for data_assembly_time (tree.pkl + stats.json)
@@ -221,6 +244,13 @@ Single source of truth for runtime tuning. Notable keys (all already in
   `no_stable_pose_action` (`exit`/`skip`/`continue`/`ignore_unstable`),
   `interactive_initial_pose`, `debug_stability`, `mark_non_blocking`,
   `filter_below_ground` — ASAPx planner behaviour.
+- `max_initial_held_parts` — budget of parts the initial-pose precheck may
+  assume are held. Applied *before* `no_stable_pose_action`: when no fully
+  self-supporting pose exists, the candidate pose with the fewest falling
+  parts is accepted if it needs at most this many held, and those parts are
+  ignored in every later stability check. 0 restores strict behaviour. Both
+  `plan()` branches route through `_relax_initial_pose_by_held_parts` on the
+  planner base class so the serial and parallel-DFA paths can't drift.
 - `heuristic_weights`, `llm_planner`, `comparison_planner`, `preference_planner`
   — per-planner configuration dicts.
 - `heuristic_weights_source` (`"default"` or `"optuna"`) +
@@ -243,6 +273,7 @@ Single source of truth for runtime tuning. Notable keys (all already in
 | Batch validate (no re-planning) | `python main.py data_manual_validation --id 00000-00200` |
 | Sweep physics params for a single id | `python main.py test_param_sweep --id 00100 …` |
 | Multi-generator timing benchmark | `python main.py data_assembly_time --id 00100-00110` |
+| Sequence-finder runtime vs part count | `python main.py data_sequence_runtime --id 00000-20016 --dir data/asap --min-parts 2 --max-parts 20 --balance-parts 3` |
 | Train heuristic weights (Optuna) | `python main.py train_heuristic_weights --id 00100-00120 --optuna-trials 30` |
 | Plot training history | `python ASAPx/plan_sequence/optimizer/plot_weight_history.py --history assets/heuristic_weights_optuna_history.json --out assets/optuna_training/history.png` |
 | Interactive assembly triage | `python main.py data_filter_assemblies --id 00000-00500 [--allow-gap]` |
@@ -258,6 +289,13 @@ Single source of truth for runtime tuning. Notable keys (all already in
   override, see `_setup_param_sweep_imports` in [main.py](main.py)) must
   hold a direct reference to the patched module object — re-importing later
   hits the evicted copy.
+- **`settings` must NOT be in the eviction set.** There is exactly one
+  `settings.py` in the repo (the root one); neither ATA nor ASAPx ships its
+  own, so evicting it cannot resolve a name clash — it only forces a fresh
+  re-read from disk, silently discarding every runtime override the caller
+  set before planning (`heuristic_weights_source="optuna"`,
+  `render_sequence=False`, `debug_stability=False`, …). Anything that flips a
+  setting around a `get_assembly_plans` call depends on this.
 - `_render_plan` first runs `play_logged_plan` for the flat per-step disassembly,
   then (when `stats['divide_split']` is present) runs
   `play_subassembly_split` to emit the unified-split clip plus each
@@ -361,6 +399,12 @@ which always includes both `heuristic` (default weights) and
 - **Per-assembly state belongs on `Assembly.storage_dir`**; everything else
   (caches, logs) underneath it.
 - **Settings, not flags**, for global behaviour: see `settings.py` keys.
+- **Pin matplotlib to `Agg` before importing `pyplot`.** matplotlib defaults
+  to an interactive backend (`qtagg`) in the dev environment, and ASAPx's
+  `DFASequencePlanner.plot_tree` calls `plt.subplots()` unconditionally at the
+  end of planning — under a GUI backend that blocks on the display server and
+  deadlocks the planner. `run_data.py` pins it at import time; the backend is
+  process-global, so that covers ASAPx's figures too.
 - **No emojis, no decorative docs** in code or markdown (per repo style).
 - **Plan/render parallelism uses `utils.parallel.parallel_execute`**, which
   treats `num_proc=1` as in-process and supports `terminate_func` for

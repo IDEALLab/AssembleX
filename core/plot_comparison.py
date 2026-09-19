@@ -20,6 +20,7 @@ Per-summary figure layout (2 × 2):
 Usage:
     python core/plot_comparison.py <target_dir>
     python core/plot_comparison.py <target_dir> --out <save_dir>
+    python core/plot_comparison.py <target_dir> --format pdf
     python core/plot_comparison.py <target_dir> --no-recursive --show
 
 No dependencies beyond matplotlib + numpy (both already in the project env).
@@ -35,8 +36,34 @@ from itertools import combinations
 from pathlib import Path
 from typing import TypedDict
 
+import matplotlib
+
+# Remember whatever backend matplotlib would auto-pick (so --show can restore
+# it), then force the non-interactive Agg backend. Without this, figure
+# creation blocks indefinitely when no display is reachable (headless servers,
+# WSL without an X server) — the process hangs after the first log line and
+# ignores Ctrl-C. `--show` opts back into the interactive backend in _cli.
+_INTERACTIVE_BACKEND = matplotlib.get_backend()
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import numpy as np
+
+# Output file format for every generated plot. matplotlib infers the backend
+# from the file extension, so switching this (via the --format CLI flag) to
+# "pdf" or "svg" is all that's needed — the default-name helpers still build
+# `.png` names, but every _render_* helper rewrites the suffix to OUTPUT_EXT
+# right before saving. Defaults to "png" to preserve prior behaviour.
+OUTPUT_EXT = "png"
+
+
+def _with_output_ext(path: Path) -> Path:
+    """Return `path` with its suffix swapped to the current `OUTPUT_EXT`.
+
+    Applied at each save site so the chosen format wins regardless of the
+    `.png` filenames the default-name helpers construct."""
+    return path.with_suffix(f".{OUTPUT_EXT}")
+
 
 # ----------------------------------------------------------------------
 # data loading + normalization
@@ -1184,6 +1211,7 @@ def _render_assembly_time_figure(
     )
     fig.tight_layout(rect=(0, 0, 1, 0.93))
 
+    save_path = _with_output_ext(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=140, bbox_inches="tight")
     if show:
@@ -1197,18 +1225,18 @@ def _default_assembly_time_overview_path(reference_path: Path) -> Path:
     directory, same suffix, but `comparison` → `stats` (or appended
     `_stats` if no `comparison` token is present). Falls back to deriving
     from the source JSON tag when given a JSON path."""
-    if reference_path.suffix == ".png":
+    if reference_path.suffix.lower() != ".json":
         stem = reference_path.stem
         if "comparison" in stem:
             new_stem = stem.replace("comparison", "stats")
         else:
             new_stem = f"{stem}_stats"
-        return reference_path.with_name(f"{new_stem}.png")
+        return reference_path.with_name(f"{new_stem}{reference_path.suffix}")
     # JSON path → mirror the main-plot naming.
     suffix = _variant_suffix(reference_path)
     return (
         reference_path.parent
-        / f"assembly_time_stats_{_run_tag_from(reference_path)}{suffix}.png"
+        / f"assembly_time_stats_{_run_tag_from(reference_path)}{suffix}.{OUTPUT_EXT}"
     )
 
 
@@ -1282,6 +1310,7 @@ def _render_assembly_time_overview(
             cell.set_text_props(fontweight="bold")
         cell.set_edgecolor("#9AAAC2")
 
+    save_path = _with_output_ext(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=140, bbox_inches="tight")
     if show:
@@ -1461,6 +1490,7 @@ def _render_manual_validation_summary(
         fontweight="bold",
     )
     fig.tight_layout(rect=(0, 0, 1, 0.94))
+    save_path = _with_output_ext(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=130, bbox_inches="tight")
     if show:
@@ -1483,6 +1513,7 @@ def _render_manual_validation_per_assembly(
         fontweight="bold",
     )
     fig.tight_layout(rect=(0, 0, 1, 0.94))
+    save_path = _with_output_ext(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=130, bbox_inches="tight")
     if show:
@@ -1693,6 +1724,7 @@ def _render_convex_decomp_accuracy(
     ax.grid(axis="y", linestyle=":", alpha=0.5)
     fig.tight_layout()
 
+    save_path = _with_output_ext(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=140, bbox_inches="tight")
     if show:
@@ -1816,6 +1848,7 @@ def _render_convex_decomp_all_tools(
         axes[empty_idx // n_cols][empty_idx % n_cols].axis("off")
     fig.tight_layout()
 
+    save_path = _with_output_ext(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=120, bbox_inches="tight")
     if show:
@@ -2323,6 +2356,7 @@ def _render_tool_selection_figure(
         fontsize=12,
         fontweight="bold",
     )
+    save_path = _with_output_ext(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=130, bbox_inches="tight")
     if show:
@@ -2439,7 +2473,7 @@ def _default_validation_overview_path(reference_path: Path) -> Path:
     """Side stats-table PNG path, derived from the main-plot path. PNG input
     → swap `beam_width_to_optimum` → `beam_width_to_optimum_stats` (or
     append `_stats`); JSON input → mirror the main-plot naming."""
-    if reference_path.suffix == ".png":
+    if reference_path.suffix.lower() != ".json":
         stem = reference_path.stem
         if "beam_width_to_optimum" in stem and "stats" not in stem:
             new_stem = stem.replace(
@@ -2447,11 +2481,11 @@ def _default_validation_overview_path(reference_path: Path) -> Path:
             )
         else:
             new_stem = f"{stem}_stats"
-        return reference_path.with_name(f"{new_stem}.png")
+        return reference_path.with_name(f"{new_stem}{reference_path.suffix}")
     suffix = _variant_suffix(reference_path)
     return (
         reference_path.parent
-        / f"beam_width_to_optimum_stats_{_run_tag_from(reference_path)}{suffix}.png"
+        / f"beam_width_to_optimum_stats_{_run_tag_from(reference_path)}{suffix}.{OUTPUT_EXT}"
     )
 
 
@@ -2640,6 +2674,7 @@ def _render_validation_overview(
             cell.set_height(cell.get_height() * header_height_scale)
         cell.set_edgecolor("#9AAAC2")
 
+    save_path = _with_output_ext(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=140, bbox_inches="tight")
     if show:
@@ -2779,6 +2814,7 @@ def _render_validation_figure(
     )
     fig.tight_layout(rect=(0, 0, 1, 0.93))
 
+    save_path = _with_output_ext(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=120, bbox_inches="tight")
     if show:
@@ -2872,6 +2908,7 @@ def _render_comparison_figure(
     fig.suptitle(title, fontsize=13, fontweight="bold")
     fig.tight_layout(rect=(0, 0, 0.93, 0.96))
 
+    save_path = _with_output_ext(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=120, bbox_inches="tight")
     if show:
@@ -3435,6 +3472,15 @@ def _cli():
         help="Don't recurse — only look at target_dir itself.",
     )
     ap.add_argument(
+        "--format",
+        type=str,
+        default="png",
+        choices=["png", "pdf", "svg"],
+        help="Output file format for every generated plot (default: png). "
+        "matplotlib picks the backend from the extension, so 'pdf' emits "
+        "vector PDFs with the same descriptive filenames.",
+    )
+    ap.add_argument(
         "--show",
         action="store_true",
         help="Also pop up an interactive window for each plot.",
@@ -3478,6 +3524,26 @@ def _cli():
     if not args.target_dir.exists():
         print(f"error: {args.target_dir} does not exist", file=sys.stderr)
         sys.exit(2)
+
+    # Set the module-level output format; every _render_* helper rewrites its
+    # save-path suffix to this before writing.
+    global OUTPUT_EXT
+    OUTPUT_EXT = args.format
+
+    # We force Agg at import so headless runs never hang. --show needs a GUI
+    # backend, so restore the interactive one matplotlib originally picked.
+    # If no display is reachable this fails gracefully — files are still
+    # written, they just don't pop up.
+    if args.show:
+        try:
+            plt.switch_backend(_INTERACTIVE_BACKEND)
+        except Exception as e:
+            print(
+                f"warning: --show requested but the interactive backend "
+                f"{_INTERACTIVE_BACKEND!r} is unavailable ({e}); "
+                f"plots are written to disk only.",
+                file=sys.stderr,
+            )
 
     find_and_plot(
         target_dir=args.target_dir,
