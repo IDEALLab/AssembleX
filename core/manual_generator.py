@@ -298,6 +298,83 @@ class ManualGenerator:
         os.unlink(tmp_path)
         return img
 
+    @staticmethod
+    def _relative_rotation_axis_angle(prev_pose, cur_pose):
+        """Axis and angle of the rotation taking the previous step's orientation
+        to the current step's, expressed in the world frame the rotation panel
+        renders in.
+
+        The panel draws parts at prev_pose, so the world-frame relative rotation
+        R_rel = R_cur @ R_prev^T has exactly the axis that should be drawn in the
+        render (equivalently: the axis in the previous step's own frame,
+        R_prev^T @ R_cur, carried through prev_pose). Returns (unit_axis (3,),
+        angle_rad) or None if the relative rotation is negligible/degenerate."""
+        R_prev = np.asarray(prev_pose, dtype=float)[:3, :3]
+        R_cur = np.asarray(cur_pose, dtype=float)[:3, :3]
+        R = R_cur @ R_prev.T
+        cos_angle = float(np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0))
+        angle = float(np.arccos(cos_angle))
+        if angle < np.radians(2.0):
+            return None
+        if angle > np.radians(178.0):
+            # Near 180 deg the (Rz - Ry, ...) form vanishes; take the axis from
+            # the dominant column of R + I (sign is inherently ambiguous here).
+            A = R + np.eye(3)
+            axis = A[:, int(np.argmax(np.linalg.norm(A, axis=0)))]
+        else:
+            axis = np.array(
+                [R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]],
+                dtype=float,
+            )
+        n = float(np.linalg.norm(axis))
+        if n < 1e-9:
+            return None
+        return axis / n, angle
+
+    def _add_rotation_arrow(self, plotter, center, radius, axis, angle, color="red"):
+        """Add a curved rotation arrow (arc + arrowhead) about `axis` through
+        `center`, sized to `radius`. The arc sweeps in the positive
+        (right-hand-rule) direction about `axis`, so it conveys the sense of the
+        reorientation; the magnitude is only clamped for legibility and no
+        numeric value is drawn."""
+        axis = np.asarray(axis, dtype=float)
+        axis = axis / (np.linalg.norm(axis) + 1e-12)
+        center = np.asarray(center, dtype=float)
+
+        # Orthonormal basis (u, v) of the plane perpendicular to axis, with
+        # (u, v, axis) right-handed so increasing t rotates u -> v about +axis.
+        ref = np.array([1.0, 0.0, 0.0])
+        if abs(float(np.dot(ref, axis))) > 0.9:
+            ref = np.array([0.0, 1.0, 0.0])
+        u = np.cross(axis, ref)
+        u /= np.linalg.norm(u) + 1e-12
+        v = np.cross(axis, u)
+
+        # Encircle the parts (arc just outside the bounding sphere) so the arrow
+        # reads clearly; the far side is naturally occluded, conveying depth.
+        arc_r = 1.12 * radius
+        # Honour the true direction; clamp the drawn sweep so it stays legible.
+        sweep = float(np.clip(angle, np.radians(80.0), np.radians(300.0)))
+        ts = np.linspace(0.0, sweep, 48)
+        pts = center + arc_r * (np.outer(np.cos(ts), u) + np.outer(np.sin(ts), v))
+        plotter.add_mesh(pv.Spline(pts, 48).tube(radius=0.05 * radius), color=color)
+
+        # Arrowhead (cone) at the leading end, tangent to the arc.
+        tangent = -np.sin(sweep) * u + np.cos(sweep) * v
+        tangent /= np.linalg.norm(tangent) + 1e-12
+        tip_base = center + arc_r * (np.cos(sweep) * u + np.sin(sweep) * v)
+        head_len = 0.28 * radius
+        plotter.add_mesh(
+            pv.Cone(
+                center=tip_base + tangent * (head_len / 2.0),
+                direction=tangent,
+                height=head_len,
+                radius=0.13 * radius,
+                resolution=24,
+            ),
+            color=color,
+        )
+
     def _render_rest_of_assembly_to_pil(
         self,
         step,
@@ -305,6 +382,9 @@ class ManualGenerator:
         color="lightgray",
         present_ids=None,
         pose_override=None,
+        camera_angle=None,
+        rotation_axis=None,
+        rotation_angle=None,
     ):
         """Render every part of the assembly EXCEPT the currently-moving part,
         using the same solid-surface styling as the main composite (no wireframe).
@@ -313,7 +393,15 @@ class ManualGenerator:
         present_ids: if given, only parts whose id is in this set are rendered.
         pose_override: if given, use this 4x4 matrix as the pose for every part
             instead of step.pose (used by the rotation panel to show the previous
-            assembly step's pose — i.e., the orientation BEFORE the rotation)."""
+            assembly step's pose — i.e., the orientation BEFORE the rotation).
+        camera_angle: if given, an angle key (e.g. "iso1") mapped via
+            convert_angle_pv_pos to the same viewpoint as the main composite;
+            otherwise the neutral "iso" preset is used.
+        rotation_axis / rotation_angle: if given, a unit axis (in this render's
+            world frame) and angle (rad); a curved rotation arrow about that axis
+            through the assembly centroid is added, showing the reorientation
+            sense. Only used by the rotation panel; other callers leave it off so
+            their renders are unchanged."""
         import os
         import tempfile
 
@@ -328,6 +416,7 @@ class ManualGenerator:
         else:
             pose = np.eye(4)
         added = 0
+        all_min = all_max = None
         for obj in self.assembly.objects.values():
             if obj.id == step.obj_id:
                 continue
@@ -335,12 +424,49 @@ class ManualGenerator:
                 continue
             mesh = obj.tri_mesh.copy().apply_transform(pose)
             plotter.add_mesh(mesh, color=color, opacity=1.0)
+            b = np.asarray(mesh.bounds, dtype=float)  # (2, 3): [min; max]
+            if all_min is None:
+                all_min, all_max = b[0].copy(), b[1].copy()
+            else:
+                all_min = np.minimum(all_min, b[0])
+                all_max = np.maximum(all_max, b[1])
             added += 1
         if added == 0:
             plotter.close()
             return Image.new("RGBA", size, (255, 255, 255, 0))
-        plotter.camera_position = "iso"
-        plotter.reset_camera()
+        plotter.camera_position = (
+            convert_angle_pv_pos(camera_angle) if camera_angle is not None else "iso"
+        )
+        if rotation_axis is not None and all_min is not None:
+            center = (all_min + all_max) / 2.0
+            radius = 0.5 * float(np.linalg.norm(all_max - all_min))
+            if radius > 1e-9:
+                try:
+                    self._add_rotation_arrow(
+                        plotter,
+                        center,
+                        radius,
+                        rotation_axis,
+                        rotation_angle if rotation_angle is not None else np.pi / 2,
+                    )
+                except Exception as e:
+                    print(f"  rotation arrow render failed: {e}")
+                # Frame to a fixed multiple of the PARTS' extent (a cube around
+                # their centroid), independent of the arrow's bounds. This keeps
+                # part size consistent between steps regardless of the arrow's
+                # axis or sweep, while leaving room for the encircling arc.
+                pad = 1.5 * radius
+                plotter.reset_camera(
+                    bounds=[
+                        center[0] - pad, center[0] + pad,
+                        center[1] - pad, center[1] + pad,
+                        center[2] - pad, center[2] + pad,
+                    ]
+                )
+            else:
+                plotter.reset_camera()
+        else:
+            plotter.reset_camera()
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             tmp_path = tmp.name
         plotter.screenshot(tmp_path)
@@ -350,14 +476,26 @@ class ManualGenerator:
         return img
 
     def _draw_offline_rotation_panel(
-        self, step, panel_size=(280, 380), present_ids=None, prev_pose=None
+        self,
+        step,
+        panel_size=(280, 380),
+        present_ids=None,
+        prev_pose=None,
+        camera_angle=None,
+        rotation_axis=None,
+        rotation_angle=None,
     ):
         """Left corner panel: rotation widget over a wireframe render of the
         already-installed parts (everything except the moving part), plus the
         hold list. Caller guarantees step.rotated and step.pose.
 
         prev_pose: if given, render the present parts in this pose (the previous
-            assembly step's pose) to show the orientation BEFORE the rotation."""
+            assembly step's pose) to show the orientation BEFORE the rotation.
+        camera_angle: the step's chosen angle key, forwarded to the render so the
+            panel shares the main composite's viewpoint instead of a fixed one.
+        rotation_axis / rotation_angle: previous->current rotation (axis in the
+            previous step's rendered frame, angle in rad); forwarded to draw the
+            rotation arrow over the parts."""
         from PIL import Image, ImageDraw
 
         panel = Image.new("RGBA", panel_size, (0, 0, 0, 0))
@@ -396,6 +534,9 @@ class ManualGenerator:
                 size=icon_size,
                 present_ids=present_ids,
                 pose_override=prev_pose,
+                camera_angle=camera_angle,
+                rotation_axis=rotation_axis,
+                rotation_angle=rotation_angle,
             )
             panel.paste(rest_img, (12, y), rest_img)
         except Exception as e:
@@ -420,10 +561,28 @@ class ManualGenerator:
                 )
         return panel
 
-    def _draw_offline_tool_panel(self, step, panel_size=(280, 380)):
-        """Right corner panel: tool icon rendered with the same solid-surface
-        styling as the main composite (no wireframe). Caller guarantees
-        step.tool is set."""
+    def _paste_mesh_icon(self, panel, draw, mesh, pos, size, body_font):
+        """Render `mesh` isometrically (same solid-surface styling as the main
+        composite) and paste it into `panel` at `pos`; on a missing mesh or a
+        render failure, draw a gray placeholder instead. Returns the y just
+        below the icon area."""
+        x, y = pos
+        if mesh is not None:
+            try:
+                icon = self._render_isolated_mesh_solid_to_pil(mesh, size=size)
+                panel.paste(icon, (x, y), icon)
+            except Exception as e:
+                print(f"  icon render failed: {e}")
+                draw.text((x, y), "(icon render failed)", fill="gray", font=body_font)
+        else:
+            draw.text((x, y), "(no mesh available)", fill="gray", font=body_font)
+        return y + size[1]
+
+    def _draw_offline_part_panel(self, step, panel_size=(280, 380)):
+        """Right corner panel: the part being installed this step (name + solid
+        isometric render), and — when the step requires a tool — the tool (name
+        + render) stacked below it. Same solid-surface styling as the main
+        composite (no wireframe)."""
         from PIL import Image, ImageDraw
 
         panel = Image.new("RGBA", panel_size, (0, 0, 0, 0))
@@ -437,24 +596,44 @@ class ManualGenerator:
         )
         title_font, body_font, _ = self._load_fonts()
 
-        y = 12
-        icon_size = (panel_size[0] - 24, 200)
+        icon_w = panel_size[0] - 24
+        has_tool = bool(step.tool)
+        # Two stacked sections (part + tool) use shorter icons so both fit the
+        # fixed panel height; a part-only panel keeps the full-height icon.
+        icon_h = 130 if has_tool else 200
 
-        draw.text((12, y), f"Tool: {step.tool}", fill="black", font=title_font)
+        y = 12
+
+        # Part section (always shown).
+        part = self.assembly.objects.get(step.obj_id)
+        part_name = part.name if part is not None else str(step.obj_id)
+        draw.text((12, y), f"Part: {part_name}", fill="black", font=title_font)
         y += 24
-        scaled = getattr(self.assembly, "scaled_tools", None) or {}
-        tool_obj = scaled.get(step.tool)
-        if tool_obj is not None and hasattr(tool_obj, "tri_mesh"):
-            try:
-                tool_img = self._render_isolated_mesh_solid_to_pil(
-                    tool_obj.tri_mesh, size=icon_size
-                )
-                panel.paste(tool_img, (12, y), tool_img)
-            except Exception as e:
-                print(f"  tool icon render failed: {e}")
-                draw.text((12, y), "(icon render failed)", fill="gray", font=body_font)
-        else:
-            draw.text((12, y), "(no mesh available)", fill="gray", font=body_font)
+        y = self._paste_mesh_icon(
+            panel,
+            draw,
+            getattr(part, "tri_mesh", None),
+            (12, y),
+            (icon_w, icon_h),
+            body_font,
+        )
+
+        # Tool section (only when the step requires a tool).
+        if has_tool:
+            y += 8
+            draw.text((12, y), f"Tool: {step.tool}", fill="black", font=title_font)
+            y += 24
+            scaled = getattr(self.assembly, "scaled_tools", None) or {}
+            tool_obj = scaled.get(step.tool)
+            tool_mesh = (
+                tool_obj.tri_mesh
+                if tool_obj is not None and hasattr(tool_obj, "tri_mesh")
+                else None
+            )
+            y = self._paste_mesh_icon(
+                panel, draw, tool_mesh, (12, y), (icon_w, icon_h), body_font
+            )
+
         return panel
 
     def _render_single_part_to_file(
@@ -575,20 +754,42 @@ class ManualGenerator:
         if not is_initial:
             if step.rotated and step.pose is not None:
                 prev_pose = None
+                # The panel depicts the orientation BEFORE this step's
+                # reorientation, so it must use the previous assembly step's
+                # viewpoint — both its pose AND its chosen camera angle — not
+                # the current step's. (In assembly order the previous step is
+                # sequence[step_idx + 1], since the sequence is disassembly
+                # order.)
+                prev_camera_angle = camera_angle
                 if step_idx + 1 < n_steps:
                     prev_step = self.assembly.sequence[step_idx + 1]
                     if prev_step.pose is not None:
                         prev_pose = np.asarray(prev_step.pose, dtype=float)
+                    if use_angle_ranking:
+                        prev_camera_angle = (
+                            self._best_angle(prev_step) if prev_step.images else "iso1"
+                        )
+                    else:
+                        prev_camera_angle = "iso1"
+                # Axis+angle of the previous->current reorientation, in the
+                # previous step's rendered frame, for the rotation arrow.
+                rotation_axis = rotation_angle = None
+                if prev_pose is not None:
+                    aa = self._relative_rotation_axis_angle(prev_pose, step.pose)
+                    if aa is not None:
+                        rotation_axis, rotation_angle = aa
                 left_panel = self._draw_offline_rotation_panel(
                     step,
                     panel_size=panel_size,
                     present_ids=present_ids,
                     prev_pose=prev_pose,
+                    camera_angle=prev_camera_angle,
+                    rotation_axis=rotation_axis,
+                    rotation_angle=rotation_angle,
                 )
                 left_panel.save(step_dir / "02_rotation_panel.png")
-            if step.tool:
-                right_panel = self._draw_offline_tool_panel(step, panel_size=panel_size)
-                right_panel.save(step_dir / "03_tool_panel.png")
+            right_panel = self._draw_offline_part_panel(step, panel_size=panel_size)
+            right_panel.save(step_dir / "03_part_panel.png")
 
         canvas = Image.new("RGBA", (1024, 1024), (255, 255, 255, 255))
         canvas.paste(base, (0, 0))
@@ -608,6 +809,77 @@ class ManualGenerator:
             canvas_rgb.save(step_dir / "final.png")
             self.assembly.instructions["Manual"].append(str(output_top))
         return str(output_top)
+
+    def compile_manual_pdf(
+        self, ablation="full", rows=3, cols=2, dpi=150, output_name=None
+    ):
+        """Stitch the per-step offline manual pages into one multi-page PDF.
+
+        Pages are laid out as a rows x cols grid (default 3 rows x 2 cols = 6
+        steps) on DIN A4 portrait sheets, ordered by assembly step (Step 1
+        first). Assembly order is the reverse of disassembly order — step_idx
+        n_steps-1 is assembly Step 1 (the initial-state page) and step_idx 0 is
+        the final step — so the pages are collected in descending step_idx.
+
+        Reads the per-step PNGs written by generate_manual_offline for the given
+        ablation. Returns the PDF path, or None if no pages were found."""
+        from PIL import Image
+
+        save_dir = self.assembly.output_dir / "manual"
+        suffix = "" if ablation == "full" else f"_{ablation}"
+
+        n_steps = len(self.assembly.sequence)
+        page_pngs = []
+        for step_idx in range(n_steps - 1, -1, -1):
+            step = self.assembly.sequence[step_idx]
+            png = save_dir / f"{step_idx}_{step.obj_id}_manual_offline{suffix}.png"
+            if png.exists():
+                page_pngs.append(png)
+        if not page_pngs:
+            print("  compile_manual_pdf: no manual pages found; skipping PDF.")
+            return None
+
+        # DIN A4 portrait in pixels at the requested DPI.
+        a4_w = round(210.0 / 25.4 * dpi)
+        a4_h = round(297.0 / 25.4 * dpi)
+        per_page = rows * cols
+        margin = round(dpi * 0.2)  # ~5mm outer margin
+        gutter = round(dpi * 0.1)  # ~2.5mm between cells
+        cell_w = (a4_w - 2 * margin - (cols - 1) * gutter) // cols
+        cell_h = (a4_h - 2 * margin - (rows - 1) * gutter) // rows
+
+        pages = []
+        for start in range(0, len(page_pngs), per_page):
+            sheet = Image.new("RGB", (a4_w, a4_h), (255, 255, 255))
+            for cell_idx, png in enumerate(page_pngs[start : start + per_page]):
+                r, c = divmod(cell_idx, cols)
+                img = Image.open(png).convert("RGB")
+                scale = min(cell_w / img.width, cell_h / img.height)
+                img = img.resize(
+                    (max(1, round(img.width * scale)), max(1, round(img.height * scale))),
+                    Image.LANCZOS,
+                )
+                x0 = margin + c * (cell_w + gutter) + (cell_w - img.width) // 2
+                y0 = margin + r * (cell_h + gutter) + (cell_h - img.height) // 2
+                sheet.paste(img, (x0, y0))
+            pages.append(sheet)
+
+        out_path = save_dir / (output_name or f"manual{suffix}.pdf")
+        pages[0].save(
+            out_path,
+            "PDF",
+            save_all=True,
+            append_images=pages[1:],
+            resolution=float(dpi),
+        )
+        if ablation == "full":
+            self.assembly.instructions["Manual"].append(str(out_path))
+        if self.assembly.evaluation and self.assembly.evaluation.verbose:
+            print(
+                f"  compiled manual PDF ({len(pages)} page(s), "
+                f"{len(page_pngs)} step(s)) -> {out_path}"
+            )
+        return str(out_path)
 
     # ------------------------------------------------------------------
     # Iterative / geometric backend (mesh -> 2D SVG, LLM only for annotation)

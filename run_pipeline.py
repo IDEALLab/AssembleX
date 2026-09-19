@@ -470,6 +470,12 @@ def run_test_pipeline(args, test_eval, output_folder, assembly_dir):
                     _timings["manual"] = (
                         _timings.get("manual", 0.0) + time.perf_counter() - _t
                     )
+            if "m" in _active:
+                _t = time.perf_counter()
+                ass.manual.compile_manual_pdf()
+                _timings["manual"] = (
+                    _timings.get("manual", 0.0) + time.perf_counter() - _t
+                )
 
         # Non-assemblable: instead of iterating every remaining part
         # with generic per-step feedback, run ONE failure-mode pass
@@ -666,6 +672,14 @@ def run_test_pipeline_batch(args, test_eval, output_folder, assembly_dir):
                                     + time.perf_counter()
                                     - _t
                                 )
+                        if "m" in _active:
+                            _t = time.perf_counter()
+                            ass.manual.compile_manual_pdf()
+                            _ass_timings["manual"] = (
+                                _ass_timings.get("manual", 0.0)
+                                + time.perf_counter()
+                                - _t
+                            )
                     elif "f" in _active:
                         _t = time.perf_counter()
                         ass.feedback.generate_failure_feedback()
