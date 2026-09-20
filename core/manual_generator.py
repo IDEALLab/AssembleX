@@ -38,6 +38,20 @@ class ManualGenerator:
     reference passed at init time.
     """
 
+    # Inset of panel content from the panel's rounded outline. The corner
+    # radius is 24, so anything closer than this crowds the border arc.
+    PANEL_PAD_X = 22
+    PANEL_PAD_TOP = 20
+
+    # Rotation-arrow geometry, as multiples of the parts' bounding-sphere
+    # radius: the arc is drawn just outside the parts so it encircles them,
+    # and the arrowhead extends past the arc's leading end.
+    ARROW_ARC_RADIUS = 1.12
+    ARROW_HEAD_LEN = 0.28
+    # Radius the arrow panel has to keep in view. Derived from the two above so
+    # resizing the arrow cannot silently leave it clipped or over-padded.
+    ARROW_VIEW_RADIUS_FACTOR = ARROW_ARC_RADIUS + ARROW_HEAD_LEN + 0.10
+
     def __init__(self, assembly, feedback):
         self.assembly = assembly
         self.feedback = feedback
@@ -349,6 +363,23 @@ class ManualGenerator:
             big = title
         return title, body, big
 
+    @staticmethod
+    def _load_italic_title_font():
+        """Italic counterpart of the title font from _load_fonts, same weight and
+        size. Returns None when no italic face is installed, so callers fall
+        back to the upright title font rather than a mismatched default."""
+        from PIL import ImageFont
+
+        for path in (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf",
+        ):
+            try:
+                return ImageFont.truetype(path, 16)
+            except OSError:
+                continue
+        return None
+
     def _fetch_step_instruction(self, step, step_idx, step_dir, camera_angle=None):
         """Reuse FeedbackGenerator.generate_instructions_from_paths to produce a
         one-sentence instruction. Falls back to a simple template if the LLM
@@ -495,7 +526,7 @@ class ManualGenerator:
 
         # Encircle the parts (arc just outside the bounding sphere) so the arrow
         # reads clearly; the far side is naturally occluded, conveying depth.
-        arc_r = 1.12 * radius
+        arc_r = self.ARROW_ARC_RADIUS * radius
         # Honour the true direction; clamp the drawn sweep so it stays legible.
         sweep = float(np.clip(angle, np.radians(80.0), np.radians(300.0)))
         ts = np.linspace(0.0, sweep, 48)
@@ -506,7 +537,7 @@ class ManualGenerator:
         tangent = -np.sin(sweep) * u + np.cos(sweep) * v
         tangent /= np.linalg.norm(tangent) + 1e-12
         tip_base = center + arc_r * (np.cos(sweep) * u + np.sin(sweep) * v)
-        head_len = 0.28 * radius
+        head_len = self.ARROW_HEAD_LEN * radius
         plotter.add_mesh(
             pv.Cone(
                 center=tip_base + tangent * (head_len / 2.0),
@@ -598,7 +629,15 @@ class ManualGenerator:
                 # their centroid), independent of the arrow's bounds. This keeps
                 # part size consistent between steps regardless of the arrow's
                 # axis or sweep, while leaving room for the encircling arc.
-                pad = 1.5 * radius
+                #
+                # reset_camera(bounds) frames the box's bounding SPHERE, i.e.
+                # half its diagonal -- a cube of half-side h shows a radius of
+                # h*sqrt(3), not h. Size the cube from the radius we actually
+                # want in view so the parts land at the same scale as the plain
+                # reset_camera() the arrow-less panels use, rather than a
+                # further 1.7x zoom-out.
+                view_radius = self.ARROW_VIEW_RADIUS_FACTOR * radius
+                pad = view_radius / np.sqrt(3.0)
                 plotter.reset_camera(
                     bounds=[
                         center[0] - pad,
@@ -667,12 +706,13 @@ class ManualGenerator:
             except OSError:
                 continue
 
-        y = 12
-        icon_size = (panel_size[0] - 24, 200)
+        pad = self.PANEL_PAD_X
+        y = self.PANEL_PAD_TOP
+        icon_size = (panel_size[0] - 2 * pad, 200)
 
-        draw.text((12, y), "Reorientation from", fill="black", font=title_font)
+        draw.text((pad, y), "Reorientation from", fill="black", font=title_font)
         y += 20
-        draw.text((12, y), "previous step:", fill="black", font=title_font)
+        draw.text((pad, y), "previous step:", fill="black", font=title_font)
         y += 22
         try:
             rest_img = self._render_rest_of_assembly_to_pil(
@@ -684,13 +724,13 @@ class ManualGenerator:
                 rotation_axis=rotation_axis,
                 rotation_angle=rotation_angle,
             )
-            panel.paste(rest_img, (12, y), rest_img)
+            panel.paste(rest_img, (pad, y), rest_img)
         except Exception as e:
             print(f"  rest-of-assembly icon render failed: {e}")
         y += icon_size[1] + 10
 
         if step.parts_fix:
-            draw.text((12, y), "Hold:", fill="black", font=title_font)
+            draw.text((pad, y), "Hold:", fill="black", font=title_font)
             y += 24
             names = []
             for pid in step.parts_fix:
@@ -699,11 +739,14 @@ class ManualGenerator:
                 )
                 names.append(obj.name if obj else str(pid))
             for name in names[:4]:
-                draw.text((22, y), f"• {name}", fill="black", font=hold_font)
+                draw.text((pad + 10, y), f"• {name}", fill="black", font=hold_font)
                 y += 22
             if len(names) > 4:
                 draw.text(
-                    (22, y), f"... +{len(names) - 4} more", fill="gray", font=hold_font
+                    (pad + 10, y),
+                    f"... +{len(names) - 4} more",
+                    fill="gray",
+                    font=hold_font,
                 )
         return panel
 
@@ -742,24 +785,32 @@ class ManualGenerator:
         )
         title_font, body_font, _ = self._load_fonts()
 
-        icon_w = panel_size[0] - 24
+        pad = self.PANEL_PAD_X
+        icon_w = panel_size[0] - 2 * pad
         has_tool = bool(step.tool)
         # Two stacked sections (part + tool) use shorter icons so both fit the
         # fixed panel height; a part-only panel keeps the full-height icon.
         icon_h = 130 if has_tool else 200
 
-        y = 12
+        y = self.PANEL_PAD_TOP
 
-        # Part section (always shown).
+        # Part section (always shown). The name stands on its own -- the panel
+        # is the part panel, so a "Part:" label only repeats that -- and is set
+        # in italics to read as a name rather than a heading.
         part = self.assembly.objects.get(step.obj_id)
         part_name = part.name if part is not None else str(step.obj_id)
-        draw.text((12, y), f"Part: {part_name}", fill="black", font=title_font)
+        draw.text(
+            (pad, y),
+            part_name,
+            fill="black",
+            font=self._load_italic_title_font() or title_font,
+        )
         y += 24
         y = self._paste_mesh_icon(
             panel,
             draw,
             getattr(part, "tri_mesh", None),
-            (12, y),
+            (pad, y),
             (icon_w, icon_h),
             body_font,
         )
@@ -767,7 +818,7 @@ class ManualGenerator:
         # Tool section (only when the step requires a tool).
         if has_tool:
             y += 8
-            draw.text((12, y), f"Tool: {step.tool}", fill="black", font=title_font)
+            draw.text((pad, y), f"Tool: {step.tool}", fill="black", font=title_font)
             y += 24
             scaled = getattr(self.assembly, "scaled_tools", None) or {}
             tool_obj = scaled.get(step.tool)
@@ -777,7 +828,7 @@ class ManualGenerator:
                 else None
             )
             y = self._paste_mesh_icon(
-                panel, draw, tool_mesh, (12, y), (icon_w, icon_h), body_font
+                panel, draw, tool_mesh, (pad, y), (icon_w, icon_h), body_font
             )
 
         return panel
