@@ -21,13 +21,27 @@ manual_show_path_trail = True
 # red end). The available frames are uniformly subsampled to this count.
 manual_path_trail_max = 7
 
+# Offline-manual base render: decide per step whether the disassembled (initial)
+# position and the path trail are worth drawing at all. Four flat-shaded probe
+# renders taken from one camera measure how much of the moving part is still
+# visible once the rest of the step's assembly is drawn (see
+# ManualGenerator._visible_fraction). Below the threshold the part disappears
+# into the assembly and the page keeps the red ghost plus the purple path; above
+# it the assembled position reads on its own and only that is drawn. Set False
+# to draw both positions on every step, as before.
+manual_auto_initial_position = True
+manual_visibility_threshold = 0.60
+# Parts whose unoccluded silhouette covers fewer pixels than this are too small
+# for the ratio to mean anything, so they always keep the initial position.
+manual_visibility_min_pixels = 200
+
 
 # ============================================================================
 # Pipeline feature toggles
 # ============================================================================
 angle_ranking = True
 part_naming = True
-tool_naming = True
+tool_naming = False
 tool_assemblability = False
 
 # When True, run DFA / step-level feedback (and leftover-collision feedback)

@@ -559,12 +559,24 @@ def judge_manual_against_checklist(
 # Per-step + per-assembly orchestration
 
 
+def _base_page_offset(assembly) -> int:
+    """1 when the manual opens with a base page, else 0.
+
+    Mirrors ManualGenerator.generate_manual_base_offline, which gives the parts
+    the disassembly left behind an assembly page of their own, shifting every
+    sequence step one number up."""
+    manual = getattr(assembly, "manual", None)
+    if manual is None or not hasattr(manual, "_base_ids"):
+        return 0
+    return 1 if manual._base_ids() else 0
+
+
 def _assembly_step_nr(step_idx, assembly) -> int:
     """Convert a disassembly index into the assembly step number the manual
     displays.  sequence[0] is the LAST assembly step, so step 0 of disassembly
-    becomes Step N (where N = len(sequence))."""
+    becomes Step N (where N = len(sequence)), offset by the base page."""
     n_steps = len(getattr(assembly, "sequence", []) or []) or (step_idx + 1)
-    return n_steps - step_idx
+    return n_steps - step_idx + _base_page_offset(assembly)
 
 
 def _checklist_filename(step_idx, step) -> str:
@@ -754,12 +766,14 @@ def validate_assembly_manual(
         return None
 
     records = []
-    # The last disassembly index = first assembly step ("place starting part on
-    # work surface"). It's a special case with no real motion / tool / fixturing
-    # to verify, so skip it entirely.
     last_idx = len(sequence) - 1
+    # Without a base page the last disassembly index is the first assembly step
+    # ("place starting part on work surface"): no real motion / tool / fixturing
+    # to verify, so skip it entirely. With one, that page carries the caption
+    # instead and every sequence step is a real installation worth validating.
+    initial_idx = None if _base_page_offset(assembly) else last_idx
     for step_idx, step in enumerate(sequence):
-        if step_idx == last_idx:
+        if step_idx == initial_idx:
             print(
                 f"[manual-val] {assembly.id}  step {step_idx}/{last_idx}  "
                 f"obj_id={getattr(step, 'obj_id', '?')}  SKIPPED (initial-state step)",

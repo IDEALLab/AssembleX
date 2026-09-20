@@ -53,8 +53,19 @@ class ManualGenerator:
         """
         seq = self.assembly.sequence
         present = {seq[i].obj_id for i in range(step_idx, len(seq))}
-        present |= {s.obj_id for s in self.assembly.remaining}
+        present |= self._base_ids()
         return present
+
+    def _base_ids(self):
+        """Part IDs that are never disassembled — the base the rest is built onto.
+
+        SequencePlanner.update_sequence pops the last part of a complete
+        disassembly into assembly.remaining (and puts every un-disassembled part
+        there on a partial plan), so these parts are already on the bench before
+        the first installation step and need an assembly page of their own.
+        """
+        seq_ids = {s.obj_id for s in self.assembly.sequence}
+        return {s.obj_id for s in self.assembly.remaining} - seq_ids
 
     @staticmethod
     def _best_angle(step, skip=()):
@@ -88,6 +99,135 @@ class ManualGenerator:
     # ------------------------------------------------------------------
     # Annotated backend (raw render + corner panel + VLM polish pass)
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Initial-position necessity test
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _count_differing_pixels(img_x, img_y, tol=8):
+        """P(x - y): how many pixels differ in colour between two renders.
+
+        `tol` absorbs the anti-aliased boundary noise that survives even flat
+        shading; a pixel genuinely covered by a different surface differs by far
+        more than a few levels.
+        """
+        diff = np.abs(img_x.astype(np.int16) - img_y.astype(np.int16)).max(axis=-1)
+        return int(np.count_nonzero(diff > tol))
+
+    def _visible_fraction(
+        self, step, present_ids=None, camera_angle=None, size=(1024, 768)
+    ):
+        """How much of the moving part's silhouette survives occlusion by the
+        rest of the assembly at this step.
+
+        Four flat-shaded probe renders are taken from ONE camera — actors are
+        toggled and the camera is never reset between shots, so the framing is
+        identical and the pixel counts are directly comparable:
+            a  context only (every present part except the moving one)
+            b  the moving part alone
+            c  context + moving part
+            d  empty scene (background only)
+        With P(x - y) the number of differing pixels, P(c - a) is the part's
+        visible area (pixels the part actually claims once everything else is
+        drawn) and P(b - d) its unoccluded area, so P(c - a) / P(b - d) is the
+        visible fraction.
+
+        Lighting is off so each render is a flat silhouette: a pixel either
+        belongs to the part or it does not, with no shading gradient for the
+        difference test to trip over.
+
+        The camera is fitted to the assembled state alone — no disassembled
+        ghost — so the part is framed slightly larger here than on the manual
+        page. Both counts scale with the framing, so the ratio is unaffected.
+
+        Returns (visible_fraction, visible_px, total_px), with visible_fraction
+        None when the part projects to too few pixels for the ratio to mean
+        anything.
+        """
+        plotter = pv.Plotter(off_screen=True, window_size=size)
+        plotter.set_background("white")
+        pose = (
+            np.asarray(step.pose, dtype=float) if step.pose is not None else np.eye(4)
+        )
+
+        context_actors = []
+        for obj in self.assembly.objects.values():
+            if obj.id == step.obj_id:
+                continue
+            if present_ids is not None and obj.id not in present_ids:
+                continue
+            mesh = obj.tri_mesh.copy().apply_transform(pose)
+            context_actors.append(
+                plotter.add_mesh(mesh, color="lightgray", opacity=1.0, lighting=False)
+            )
+
+        moving = self.assembly.objects[step.obj_id]
+        moving_actor = plotter.add_mesh(
+            moving.tri_mesh.copy().apply_transform(pose),
+            color="blue",
+            opacity=1.0,
+            lighting=False,
+        )
+
+        plotter.camera_position = convert_angle_pv_pos(
+            camera_angle if camera_angle is not None else "iso1"
+        )
+        plotter.reset_camera()
+
+        def shot(show_context, show_moving):
+            for actor in context_actors:
+                actor.SetVisibility(show_context)
+            moving_actor.SetVisibility(show_moving)
+            # SetVisibility alone does not invalidate the rendered frame, so
+            # without this every probe would screenshot the same image and both
+            # pixel counts would come back 0.
+            plotter.render()
+            return np.asarray(plotter.screenshot(return_img=True))
+
+        try:
+            img_c = shot(True, True)
+            img_a = shot(True, False)
+            img_b = shot(False, True)
+            img_d = shot(False, False)
+        finally:
+            plotter.close()
+
+        visible_px = self._count_differing_pixels(img_c, img_a)
+        total_px = self._count_differing_pixels(img_b, img_d)
+        min_px = max(int(getattr(settings, "manual_visibility_min_pixels", 200)), 1)
+        if total_px < min_px:
+            return None, visible_px, total_px
+        return visible_px / total_px, visible_px, total_px
+
+    def _should_show_initial_position(self, step, present_ids=None, camera_angle=None):
+        """Whether this step needs the disassembled-position ghost and the path
+        trail, or reads clearly from the assembled position alone.
+
+        A step is clear when enough of the moving part stays visible in the
+        assembled state for a reader to see where it goes; only when the part
+        largely disappears into the assembly does the page have to show where it
+        comes from.  Any failure to measure falls back to showing them, so a
+        broken render can never silently strip information off a page.
+
+        Returns (show_initial, info); info records the measurement for the
+        per-step log.
+        """
+        threshold = float(getattr(settings, "manual_visibility_threshold", 0.6))
+        info = {"threshold": threshold}
+        try:
+            fraction, visible_px, total_px = self._visible_fraction(
+                step, present_ids=present_ids, camera_angle=camera_angle
+            )
+        except Exception as e:
+            info["error"] = f"{type(e).__name__}: {e}"
+            return True, info
+        info["visible_px"] = visible_px
+        info["total_px"] = total_px
+        info["visible_fraction"] = fraction
+        if fraction is None:
+            info["reason"] = "part silhouette too small to measure"
+            return True, info
+        return fraction < threshold, info
+
     def _render_base_composite_to_file(
         self,
         step,
@@ -108,8 +248,11 @@ class ManualGenerator:
             ranking; use this to keep a consistent viewing direction across steps.
         include_motion: if False, the red disassembled-position ghost AND the
             purple intermediate-trail dots are skipped — only the blue assembled
-            position is drawn.  Used by the validator's ablation studies to
-            measure the contribution of the assembly-process visualisation."""
+            position is drawn.  Set by the caller either from the per-step
+            visibility test (see `_should_show_initial_position`, which turns
+            them off for steps whose assembled position is plainly visible) or
+            by the validator's ablation studies, to measure the contribution of
+            the assembly-process visualisation."""
         plotter = pv.Plotter(off_screen=True, window_size=size)
         plotter.set_background("white")
         angle = (
@@ -458,9 +601,12 @@ class ManualGenerator:
                 pad = 1.5 * radius
                 plotter.reset_camera(
                     bounds=[
-                        center[0] - pad, center[0] + pad,
-                        center[1] - pad, center[1] + pad,
-                        center[2] - pad, center[2] + pad,
+                        center[0] - pad,
+                        center[0] + pad,
+                        center[1] - pad,
+                        center[1] + pad,
+                        center[2] - pad,
+                        center[2] + pad,
                     ]
                 )
             else:
@@ -636,26 +782,19 @@ class ManualGenerator:
 
         return panel
 
-    def _render_single_part_to_file(
-        self, step, save_path, size=(1024, 768), camera_angle=None
+    def _render_parts_neutral_to_file(
+        self, obj_ids, pose, save_path, size=(1024, 768), camera_angle="iso1"
     ):
-        """Render one part in lightgray with no blue/red position markers, in the
-        simulation's pose frame for this step.  Used for the initial-state
-        assembly page where there is nothing to install into."""
+        """Render the given parts in lightgray with no blue/red position markers,
+        in the given pose frame.  Used for the initial-state assembly page, where
+        nothing is being installed yet."""
         plotter = pv.Plotter(off_screen=True, window_size=size)
         plotter.set_background("white")
-        angle = (
-            camera_angle
-            if camera_angle is not None
-            else (self._best_angle(step) if step.images else "iso1")
-        )
-        pose = (
-            np.asarray(step.pose, dtype=float) if step.pose is not None else np.eye(4)
-        )
-        mesh = self.assembly.objects[step.obj_id].tri_mesh.copy().apply_transform(pose)
-        plotter.add_mesh(mesh, color="lightgray", opacity=1.0)
-        cam = convert_angle_pv_pos(angle)
-        plotter.camera_position = cam
+        pose = np.asarray(pose, dtype=float) if pose is not None else np.eye(4)
+        for obj_id in obj_ids:
+            mesh = self.assembly.objects[obj_id].tri_mesh.copy().apply_transform(pose)
+            plotter.add_mesh(mesh, color="lightgray", opacity=1.0)
+        plotter.camera_position = convert_angle_pv_pos(camera_angle)
         plotter.reset_camera()
         plotter.screenshot(str(save_path))
         plotter.close()
@@ -668,9 +807,13 @@ class ManualGenerator:
         """Fully offline manual page: composite render + programmatic corner
         panel + LLM instruction sentence.
 
-        When step_idx is the last disassembly step (first assembly step, only one
-        part present), a simplified initial-state page is rendered: a neutral
-        single-part view with a short fixed caption and no corner panels.
+        Every disassembly step is a real installation page.  The initial state —
+        the parts left over by the disassembly (assembly._base_ids) — gets its own
+        page from generate_manual_base_offline, which this method triggers once,
+        on the last disassembly step.  Only when the disassembly left nothing
+        behind does the last step itself become the simplified initial-state page
+        (a neutral single-part view with a short fixed caption and no corner
+        panels).
 
         ablation: one of self.ABLATIONS.  Controls which features are disabled
             in this rendering so the validator can measure their contribution:
@@ -682,7 +825,8 @@ class ManualGenerator:
                                    "Step N", just with no sentences).
               "no_motion"        — base composite omits the red disassembled-
                                    position ghost and the purple intermediate
-                                   path trail.
+                                   path trail, on every step, overriding the
+                                   per-step visibility test.
             The output filename gets a per-ablation suffix so all four pages
             coexist on disk under the same step folder.
         """
@@ -712,9 +856,14 @@ class ManualGenerator:
             camera_angle = "iso1"
 
         n_steps = len(self.assembly.sequence)
-        assembly_step_nr = n_steps - step_idx
+        base_ids = self._base_ids()
+        # The leftover base parts get an assembly page of their own (Step 1), so
+        # every disassembly step shifts one number up.
+        assembly_step_nr = n_steps - step_idx + (1 if base_ids else 0)
         step_title = f"Step {assembly_step_nr}"
-        is_initial = step_idx == n_steps - 1
+        # Only the last disassembly step can be the initial-state page, and only
+        # when the disassembly left nothing behind for the base page to show.
+        is_initial = step_idx == n_steps - 1 and not base_ids
 
         present_ids = self._present_ids(step_idx)
         # Use ablation-specific base render so we don't clobber the baseline.
@@ -722,8 +871,12 @@ class ManualGenerator:
         base_path = step_dir / f"01_base_render{base_suffix}.png"
 
         if is_initial:
-            self._render_single_part_to_file(
-                step, base_path, size=(1024, 768), camera_angle=camera_angle
+            self._render_parts_neutral_to_file(
+                [step.obj_id],
+                step.pose,
+                base_path,
+                size=(1024, 768),
+                camera_angle=camera_angle,
             )
             part_name = self.assembly.objects[step.obj_id].name
             instruction = (
@@ -731,6 +884,28 @@ class ManualGenerator:
             )
             (step_dir / "instruction.txt").write_text(instruction)
         else:
+            # Steps whose assembled position is plainly visible don't need the
+            # disassembled ghost and the path trail — drawing both positions
+            # there only adds clutter.  The no_motion ablation has already
+            # turned them off, so leave that case alone.
+            if include_motion and getattr(
+                settings, "manual_auto_initial_position", True
+            ):
+                include_motion, visibility = self._should_show_initial_position(
+                    step, present_ids=present_ids, camera_angle=camera_angle
+                )
+                visibility["show_initial_position"] = include_motion
+                (step_dir / f"visibility{base_suffix}.json").write_text(
+                    json.dumps(visibility, indent=2)
+                )
+                if self.assembly.evaluation and self.assembly.evaluation.verbose:
+                    frac = visibility.get("visible_fraction")
+                    print(
+                        f"  step {step_idx} ({step.obj_id}): visible fraction "
+                        f"{'n/a' if frac is None else f'{frac:.2f}'} "
+                        f"(threshold {visibility['threshold']:.2f}) -> "
+                        f"{'showing' if include_motion else 'hiding'} initial position"
+                    )
             self._render_base_composite_to_file(
                 step,
                 base_path,
@@ -752,25 +927,27 @@ class ManualGenerator:
         left_panel = None
         right_panel = None
         if not is_initial:
-            if step.rotated and step.pose is not None:
-                prev_pose = None
+            # The last disassembly step is the FIRST installation step, so there
+            # is no previous step to have been reoriented from: the base page it
+            # follows is rendered in this step's own frame.
+            has_prev_step = step_idx + 1 < n_steps
+            if step.rotated and step.pose is not None and has_prev_step:
                 # The panel depicts the orientation BEFORE this step's
                 # reorientation, so it must use the previous assembly step's
                 # viewpoint — both its pose AND its chosen camera angle — not
                 # the current step's. (In assembly order the previous step is
                 # sequence[step_idx + 1], since the sequence is disassembly
                 # order.)
-                prev_camera_angle = camera_angle
-                if step_idx + 1 < n_steps:
-                    prev_step = self.assembly.sequence[step_idx + 1]
-                    if prev_step.pose is not None:
-                        prev_pose = np.asarray(prev_step.pose, dtype=float)
-                    if use_angle_ranking:
-                        prev_camera_angle = (
-                            self._best_angle(prev_step) if prev_step.images else "iso1"
-                        )
-                    else:
-                        prev_camera_angle = "iso1"
+                prev_pose = None
+                prev_step = self.assembly.sequence[step_idx + 1]
+                if prev_step.pose is not None:
+                    prev_pose = np.asarray(prev_step.pose, dtype=float)
+                if use_angle_ranking:
+                    prev_camera_angle = (
+                        self._best_angle(prev_step) if prev_step.images else "iso1"
+                    )
+                else:
+                    prev_camera_angle = "iso1"
                 # Axis+angle of the previous->current reorientation, in the
                 # previous step's rendered frame, for the rotation arrow.
                 rotation_axis = rotation_angle = None
@@ -808,6 +985,76 @@ class ManualGenerator:
         if ablation == "full":
             canvas_rgb.save(step_dir / "final.png")
             self.assembly.instructions["Manual"].append(str(output_top))
+
+        # The base page has no step of its own to be driven from, so emit it
+        # alongside the step it precedes — the last disassembly step.
+        if base_ids and step_idx == n_steps - 1:
+            self.generate_manual_base_offline(ablation=ablation)
+        return str(output_top)
+
+    def generate_manual_base_offline(self, ablation="full"):
+        """Assembly Step 1 page: the parts the disassembly left behind.
+
+        Those parts (see `_base_ids`) are already on the bench when the first
+        installation step starts, so without this page they would silently
+        appear in the grey context of Step 2.  The page is rendered in the frame
+        of the step that follows it, so no reorientation separates the two.
+
+        Returns the page path, or None when the disassembly left nothing behind.
+        """
+        from PIL import Image
+
+        base_ids = sorted(self._base_ids())
+        if not base_ids:
+            return None
+
+        save_dir = self.assembly.output_dir / "manual"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        step_dir = save_dir / "step_base_offline"
+        step_dir.mkdir(parents=True, exist_ok=True)
+        suffix = "" if ablation == "full" else f"_{ablation}"
+
+        # Share the frame of the first installation step (the last disassembly
+        # step) so the reader's viewpoint carries over unchanged.
+        next_step = self.assembly.sequence[-1] if self.assembly.sequence else None
+        pose = next_step.pose if next_step is not None else None
+        if ablation == "no_angle_ranking" or next_step is None:
+            camera_angle = "iso1"
+        else:
+            camera_angle = self._best_angle(next_step) if next_step.images else "iso1"
+
+        base_path = step_dir / f"01_base_render{suffix}.png"
+        self._render_parts_neutral_to_file(
+            base_ids, pose, base_path, size=(1024, 768), camera_angle=camera_angle
+        )
+
+        names = [self.assembly.objects[i].name or f"part {i}" for i in base_ids]
+        if len(names) == 1:
+            instruction = (
+                f"Place {names[0]} on the work surface as the starting component."
+            )
+        else:
+            instruction = (
+                f"Place {', '.join(names[:-1])} and {names[-1]} on the work surface "
+                "as the starting components."
+            )
+        (step_dir / "instruction.txt").write_text(instruction)
+
+        canvas = Image.new("RGBA", (1024, 1024), (255, 255, 255, 255))
+        canvas.paste(Image.open(base_path).convert("RGBA"), (0, 0))
+        self._draw_bottom_instruction_text(
+            canvas,
+            "" if ablation == "no_text" else instruction,
+            region=(0, 768, 1024, 1024),
+            title="Step 1",
+        )
+        canvas_rgb = canvas.convert("RGB")
+
+        output_top = save_dir / f"base_manual_offline{suffix}.png"
+        canvas_rgb.save(output_top)
+        if ablation == "full":
+            canvas_rgb.save(step_dir / "final.png")
+            self.assembly.instructions["Manual"].append(str(output_top))
         return str(output_top)
 
     def compile_manual_pdf(
@@ -817,9 +1064,9 @@ class ManualGenerator:
 
         Pages are laid out as a rows x cols grid (default 3 rows x 2 cols = 6
         steps) on DIN A4 portrait sheets, ordered by assembly step (Step 1
-        first). Assembly order is the reverse of disassembly order — step_idx
-        n_steps-1 is assembly Step 1 (the initial-state page) and step_idx 0 is
-        the final step — so the pages are collected in descending step_idx.
+        first). Assembly order is the reverse of disassembly order, so the pages
+        are collected in descending step_idx, behind the base page (assembly
+        Step 1, the parts the disassembly left behind) when there is one.
 
         Reads the per-step PNGs written by generate_manual_offline for the given
         ablation. Returns the PDF path, or None if no pages were found."""
@@ -830,6 +1077,11 @@ class ManualGenerator:
 
         n_steps = len(self.assembly.sequence)
         page_pngs = []
+        base_png = save_dir / f"base_manual_offline{suffix}.png"
+        if not base_png.exists() and self._base_ids():
+            self.generate_manual_base_offline(ablation=ablation)
+        if base_png.exists():
+            page_pngs.append(base_png)
         for step_idx in range(n_steps - 1, -1, -1):
             step = self.assembly.sequence[step_idx]
             png = save_dir / f"{step_idx}_{step.obj_id}_manual_offline{suffix}.png"
@@ -856,7 +1108,10 @@ class ManualGenerator:
                 img = Image.open(png).convert("RGB")
                 scale = min(cell_w / img.width, cell_h / img.height)
                 img = img.resize(
-                    (max(1, round(img.width * scale)), max(1, round(img.height * scale))),
+                    (
+                        max(1, round(img.width * scale)),
+                        max(1, round(img.height * scale)),
+                    ),
                     Image.LANCZOS,
                 )
                 x0 = margin + c * (cell_w + gutter) + (cell_w - img.width) // 2
