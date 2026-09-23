@@ -437,6 +437,88 @@ class SequencePlanner:
             if tool is not None:
                 step.tool = tool
 
+    def _sequence_file(self):
+        return self.assembly.storage_dir / "sequence.json"
+
+    def _read_sequence_file(self):
+        """Load ``sequence.json`` as a dict, or None when it is missing/unreadable."""
+        seq_file_path = self._sequence_file()
+        if not seq_file_path.exists():
+            return None
+        try:
+            with open(seq_file_path) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[angle_ranking] could not read {seq_file_path}: {e}")
+            return None
+
+    def _load_angle_ranking(self):
+        """Load the cached per-step angle ranking from ``sequence.json``.
+
+        Shape: ``{part_id: [[score, angle], ...]}``, best angle first. Returns
+        ``{}`` when the file or the key is absent -- sequence.json files
+        written before angle-ranking caching simply get re-ranked once.
+        """
+        data = self._read_sequence_file() or {}
+        cached = data.get("angle_ranking")
+        return cached if isinstance(cached, dict) else {}
+
+    def _save_angle_ranking(self, rankings):
+        """Merge ``rankings`` into ``sequence.json`` under ``angle_ranking``.
+
+        Read-modify-write, so every other key (including ones this version
+        doesn't know about) survives, and an older file just gains the key.
+        """
+        if not rankings:
+            return
+        data = self._read_sequence_file()
+        if data is None:
+            # Nothing planned/cached yet (or unreadable) -- nowhere to persist
+            # to without inventing a sequence.json the planner never wrote.
+            return
+        merged = data.get("angle_ranking")
+        merged = dict(merged) if isinstance(merged, dict) else {}
+        merged.update(rankings)
+        data["angle_ranking"] = merged
+        seq_file_path = self._sequence_file()
+        tmp_path = seq_file_path.with_name(seq_file_path.name + ".tmp")
+        with open(tmp_path, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, seq_file_path)
+
+    def rank_sequence_angles(self, show=False, verbose=True):
+        """Rank every step's camera angles best->worst, reusing the ranking
+        cached in ``sequence.json`` when it still covers the rendered angles.
+
+        The SSIM scoring re-reads every extracted frame of every angle of
+        every step, which is the expensive part; the ranking itself only
+        reorders ``Step.images`` / ``Step.gifs``. Freshly computed rankings
+        are written back under the ``angle_ranking`` key, so a re-run that
+        hits the cached sequence.json skips the scoring entirely.
+
+        ``show=True`` bypasses the cache (the diff-image plot needs the
+        scoring pass). Returns ``{part_id: [(score, angle), ...]}``.
+        """
+        cached = {} if show else self._load_angle_ranking()
+        rankings = {}
+        fresh = {}
+        for step in self.assembly.sequence:
+            key = str(step.obj_id)
+            entry = cached.get(key)
+            applied = (
+                step.apply_angle_ranking(entry, verbose=verbose)
+                if entry is not None
+                else None
+            )
+            if applied is not None:
+                rankings[key] = applied
+                continue
+            ranking = step.rank_angles(show=show, verbose=verbose)
+            rankings[key] = ranking
+            fresh[key] = [[score, angle] for score, angle in ranking]
+        self._save_angle_ranking(fresh)
+        return rankings
+
     def _build_tool_meshes_for_plan(self, plan_sequence):
         """For each part in ``plan_sequence`` that has a cached tool decision, return
         a positioned tool mesh ready to be passed to ``play_logged_plan``.

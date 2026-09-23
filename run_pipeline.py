@@ -442,8 +442,7 @@ def run_test_pipeline(args, test_eval, output_folder, assembly_dir):
         # Rank the angles of the assembly sequence images
         if settings.angle_ranking:
             _t = time.perf_counter()
-            for step in ass.sequence:
-                step.rank_angles(show=False)
+            ass.planner.rank_sequence_angles(show=False)
             _timings["angle_ranking"] = time.perf_counter() - _t
 
         # Find out if the assembly requires tools
@@ -641,8 +640,7 @@ def run_test_pipeline_batch(args, test_eval, output_folder, assembly_dir):
                     # Angle ranking
                     if settings.angle_ranking:
                         _t = time.perf_counter()
-                        for step in ass.sequence:
-                            step.rank_angles(show=False)
+                        ass.planner.rank_sequence_angles(show=False)
                         _ass_timings["angle_ranking"] = time.perf_counter() - _t
 
                     if assemblable:

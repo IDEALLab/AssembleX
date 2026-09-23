@@ -2710,8 +2710,7 @@ def run_data_manual_validation(args, test_eval, output_folder, assembly_dir):
                 # manual generator picks the best-ranked view (matches
                 # the test_pipeline ordering).
                 if settings.angle_ranking:
-                    for step in ass.sequence:
-                        step.rank_angles(show=False)
+                    ass.planner.rank_sequence_angles(show=False)
 
                 _validate_manual(
                     ass,

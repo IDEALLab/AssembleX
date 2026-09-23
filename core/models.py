@@ -266,6 +266,43 @@ class Step:
         if gif_path:
             self.gifs["iso1"] = gif_path
 
+    def rendered_angles(self):
+        """Angle keys that currently have extracted frames -- the set
+        rank_angles() scores, and the set a cached ranking has to cover for
+        apply_angle_ranking() to consider it still valid."""
+        return {angle for angle, img_paths in self.images.items() if img_paths}
+
+    def _reorder_by_ranking(self, ranking):
+        """Reorder images/gifs to the (score, angle) order in `ranking`.
+
+        Angles absent from the ranking are dropped (they have no frames)."""
+        temp_imgs = {}
+        temp_gifs = {}
+        for _score, angle in ranking:
+            temp_imgs[angle] = self.images[angle]
+            temp_gifs[angle] = self.gifs.get(angle)
+        self.images = temp_imgs
+        self.gifs = temp_gifs
+
+    def apply_angle_ranking(self, ranking, verbose=True):
+        """Reorder images/gifs from a ranking produced by an earlier
+        rank_angles() call (e.g. one cached in sequence.json) instead of
+        re-reading every frame and re-scoring it.
+
+        Returns the normalised ranking when it was applied, or None when it is
+        stale -- i.e. it does not cover exactly the angles rendered now -- in
+        which case the step is left untouched and the caller should re-rank."""
+        try:
+            ranking = sorted((float(score), angle) for score, angle in ranking)
+        except (TypeError, ValueError):
+            return None
+        if {angle for _score, angle in ranking} != self.rendered_angles():
+            return None
+        self._reorder_by_ranking(ranking)
+        if verbose:
+            print(f"Angle ranking for step {self.obj_id} (cached): {ranking}")
+        return ranking
+
     def rank_angles(self, show=False, verbose=True):
         ranking = []
         diff_images = {}
@@ -276,7 +313,7 @@ class Step:
                 score, diff_image = ssim(
                     first_frame, last_frame, full=True, channel_axis=-1
                 )
-                ranking.append((score, angle))
+                ranking.append((float(score), angle))
                 diff_images[angle] = diff_image
 
         if show:
@@ -303,14 +340,7 @@ class Step:
             plt.show()
 
         ranking.sort()
-
-        temp_imgs = {}
-        temp_gifs = {}
-        for score, angle in ranking:
-            temp_imgs[angle] = self.images[angle]
-            temp_gifs[angle] = self.gifs[angle]
-        self.images = temp_imgs
-        self.gifs = temp_gifs
+        self._reorder_by_ranking(ranking)
 
         if verbose:
             print(f"Angle ranking for step {self.obj_id}: {ranking}")

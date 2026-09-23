@@ -203,8 +203,7 @@ def run_test_tools(args, test_eval, output_folder, assembly_dir):
         ass.get_assembly_plans(args)
 
         if settings.angle_ranking:
-            for step in ass.sequence:
-                step.rank_angles(show=False)
+            ass.planner.rank_sequence_angles(show=False)
 
         summary = []
         for step_idx, step in enumerate(ass.sequence):
