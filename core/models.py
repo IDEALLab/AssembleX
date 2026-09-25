@@ -262,6 +262,11 @@ class Step:
         self.pose = None
         self.rotated = False
         self.parts_fix = []
+        # Block path in the recursive subassembly plan: [] when the step
+        # belongs to no subassembly, ["S"] for the top-level S block,
+        # ["S", "R"] for the R half of S, and so on. Empty on every run that
+        # produced no split plan.
+        self.subassembly = []
 
         if gif_path:
             self.gifs["iso1"] = gif_path

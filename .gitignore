@@ -228,6 +228,11 @@ __marimo__/
 assets/*
 # but ship the tool catalog (meshes + axis/normalization metadata)
 !assets/tools/
+# and the example assembly (part meshes + metadata; .sdf caches are regenerated)
+!assets/data/
+assets/data/*
+!assets/data/04489/
+assets/data/04489/*.sdf
 archive
 
 # editor / local config

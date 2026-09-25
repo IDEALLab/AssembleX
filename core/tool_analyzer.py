@@ -8,7 +8,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pyvista as pv
 import trimesh
-from ATA.examples.run_joint_plan import BFSPlanner
 from matplotlib.patches import Patch
 from PIL import Image
 
@@ -1433,6 +1432,18 @@ class ToolAnalyzer:
             True iff BFSPlanner succeeds for both the tool-alone and tool+part-combined
             cases. The scratch directory is removed on exit.
         """
+        # ATA is the optional legacy backend; imported here so the module stays
+        # importable (and the rest of the pipeline usable) without it.
+        try:
+            from ATA.examples.run_joint_plan import BFSPlanner
+        except ImportError as exc:
+            raise ImportError(
+                "Geometric tool-assemblability checking uses the optional ATA "
+                "backend, which is not installed. Initialise it with "
+                "`git submodule update --init --recursive ATA`, or leave "
+                "settings.tool_assemblability / --seq-tool-check off."
+            ) from exc
+
         if verbose:
             print("Checking if the tool can be applied without collisions...")
 

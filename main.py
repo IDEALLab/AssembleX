@@ -78,6 +78,33 @@ DISPATCH = {
     "test_archive_ASAP": run_test_archive_ASAP,
 }
 
+# The assembly tracked in this repository (assets/data/04489). It is the
+# fallback when no --id is given, so a fresh checkout runs end to end without
+# downloading a dataset first.
+DEFAULT_ASSEMBLY_DIR = "data"
+DEFAULT_ASSEMBLY_ID = "04489"
+
+# Subcommands that never touch an assembly: both tool collectors only read
+# --data-dir. They must not pull in the fallback assembly, since loading one
+# preprocesses its meshes for nothing.
+NO_ASSEMBLY_TESTS = {"collect_tool_data", "collect_tool_axes"}
+
+
+def wants_default_assembly(args):
+    """True when an omitted --id should fall back to DEFAULT_ASSEMBLY_ID.
+
+    Only when the subcommand actually needs an assembly and the run has no
+    other source of work: `data_assembly_time` / `data_sequence_runtime` with
+    --data-dir re-plot an earlier run's numbers and return before looking at
+    test_eval.assemblies, so defaulting an id there would preprocess a mesh
+    nothing reads.
+    """
+    if args.id is not None:
+        return False
+    if args.test_type in NO_ASSEMBLY_TESTS:
+        return False
+    return not getattr(args, "data_dir", None)
+
 
 if __name__ == "__main__":
     output_folder = create_output_directory()
@@ -90,13 +117,13 @@ if __name__ == "__main__":
         "--id",
         type=str,
         default=None,
-        help="assembly id (e.g. 00000) or inclusive range (e.g. 00000-00010). Optional: omit for subcommands that do not operate on assemblies (e.g. collect_tool_data / collect_tool_axes, which only read --data-dir).",
+        help=f"assembly id (e.g. 00000) or inclusive range (e.g. 00000-00010). Omit to use the assembly shipped with the repository ({DEFAULT_ASSEMBLY_ID}); subcommands that do not operate on assemblies (collect_tool_data / collect_tool_axes, which only read --data-dir) ignore it either way.",
     )
     parser.add_argument(
         "--dir",
         type=str,
-        default="data/multi_assembly",
-        help="directory storing all assemblies",
+        default=DEFAULT_ASSEMBLY_DIR,
+        help="directory storing all assemblies, resolved under assets/",
     )
     parser.add_argument(
         "--cache",
@@ -332,7 +359,10 @@ if __name__ == "__main__":
         "--seq-optimizer",
         default=None,
         help=(
-            "Choose 'divide' to enable the divide optimizer, which splits the assembly into subassemblies."
+            "Choose 'divide' to enable the divide optimizer, which splits the assembly "
+            "into subassemblies. With settings.subassembly_plan on (the default) this "
+            "also builds the recursive prefix -> unified split -> S -> R plan that "
+            "orders the manual and draws its per-subassembly page borders."
         ),
     )
     parser.add_argument(
@@ -388,6 +418,18 @@ if __name__ == "__main__":
     )
     if _excluded_ids:
         print(f"Holding out {len(_excluded_ids)} assembly id(s): {_excluded_ids}")
+    if wants_default_assembly(args):
+        if os.path.isdir(os.path.join(assembly_dir, DEFAULT_ASSEMBLY_ID)):
+            args.id = DEFAULT_ASSEMBLY_ID
+            print(
+                "No --id given; using the assembly shipped with the repository "
+                f"({DEFAULT_ASSEMBLY_ID} in {assembly_dir})."
+            )
+        else:
+            print(
+                f"No --id given and {DEFAULT_ASSEMBLY_ID} is not in "
+                f"{assembly_dir}; pass --id to select an assembly."
+            )
     if args.id is not None:
         for _id in resolve_ids(
             args.id,

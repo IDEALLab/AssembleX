@@ -367,6 +367,69 @@ divide_weights = {
 # sub-sequences in debug output. The full sequence is always returned.
 divide_split_threshold = 0.1
 
+# Recursive subassembly plan (prefix -> unified split -> S -> R, recursively).
+# Only active when the run also passes --seq-optimizer divide, since it builds
+# on the DivideOptimizer's obstruction graph. When a plan is found, the block
+# order is realised either as the cheapest tree path that respects it (and then
+# stats['sequence'] is replaced with that path, so the renderer follows the same
+# order) or, when no path does, as an order derived from the plan itself -- in
+# which case stats['sequence'] is left alone and only the manual reads the split
+# order. Off restores the pre-plan behaviour entirely.
+# See ASAPx/plan_sequence/optimizer/split_plan.py.
+subassembly_plan = True
+
+# How many levels of nesting to look for. 1 = a single top-level S/R split,
+# 2 = S and R may each split once more, and so on. Each extra level costs one
+# restricted obstruction search plus a physics verification per block.
+subassembly_max_depth = 2
+
+# Blocks smaller than this are not searched for a further split.
+subassembly_min_parts = 4
+
+# Per-block search budget handed to DivideOptimizer.find_locally_free_subassemblies
+# and verify_locally_free.
+subassembly_search_timeout = 100
+subassembly_verify_top_k = 10
+
+# Re-run the cut search at every prefix state of the block's sequence instead
+# of only at the full block (DivideOptimizer.sweep_sequence_states). This finds
+# subassemblies that are locked inside the full block and only become separable
+# once an obstructing part is gone -- the existing propagation cannot, because
+# it only shrinks cuts that were already free initially.
+#
+# Cost is close to free: the obstruction graph is shared across states, so this
+# is pure graph work on a shrinking universe (measured +0.3s on a 17-part
+# assembly whose planning takes ~12 min). Physics is unaffected --
+# verify_separation depends only on (S, R), never on the state, so the pooled
+# top-k costs the same to verify as the initial-state top-k.
+subassembly_sweep_states = True
+
+# Cap on how many prefix states to search per block (None = every state down to
+# subassembly_min_parts). Lower it if a very large assembly makes the DFS the
+# bottleneck.
+subassembly_sweep_max_states = None
+
+# Manual page framing per subassembly side: outline colour for pages whose step
+# belongs to the S block and the R block. Nested blocks get one ring per level,
+# outermost = top-level side. RGB tuples.
+subassembly_colors = {
+    "S": (26, 152, 80),  # green
+    "R": (123, 50, 148),  # purple
+}
+
+# Thickness in px of each subassembly ring drawn around a manual page, and the
+# gap between consecutive rings when a step is nested (e.g. S.R).
+subassembly_border_width = 10
+subassembly_border_gap = 6
+
+# Tone ladder for nested rings, indexed by nesting level. The hue says WHICH
+# side (green = S, purple = R); the tone says HOW DEEP. Positive blends the
+# side's colour toward white, negative toward black; level 0 is the colour
+# itself. Alternating the direction keeps adjacent rings distinct at any depth
+# -- two nested S blocks would otherwise be the same green twice, which is what
+# made a nested page hard to read. Levels past the end reuse the last entry.
+subassembly_shade_ladder = (0.0, 0.40, -0.40, 0.65, -0.65)
+
 
 # ============================================================================
 # Optuna-trained heuristic weights

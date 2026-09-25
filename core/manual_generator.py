@@ -64,11 +64,132 @@ class ManualGenerator:
         already installed).  The parts visible at this step are the current part
         plus all parts removed LATER in disassembly (already installed before
         this step in assembly), plus assembly.remaining (never disassembled).
+
+        Under a subassembly plan the result is additionally clipped to the block
+        the step belongs to.  A step inside S is performed while R is a separate
+        body on the bench, so R must not appear in its context -- and because the
+        plan orders the sequence prefix -> split -> S -> R, "removed at or after
+        this step, and in this block" is exactly "installed so far in this
+        block".  With no plan every step's block is the whole assembly and this
+        reduces to the flat behaviour.
         """
         seq = self.assembly.sequence
         present = {seq[i].obj_id for i in range(step_idx, len(seq))}
         present |= self._base_ids()
-        return present
+        group = list(getattr(seq[step_idx], "subassembly", None) or [])
+        return present & self._block_parts(group)
+
+    # ------------------------------------------------------------------
+    # Subassembly plan accessors
+    # ------------------------------------------------------------------
+    def _split_steps(self):
+        """Flattened subassembly plan in disassembly order, or [] when the run
+        produced none.  Entries are 'remove' (one per part, mapping onto
+        assembly.sequence) and 'join' (a unified S/R mating, which has no Step
+        because it is not a tree edge)."""
+        return list(getattr(self.assembly, "split_steps", None) or [])
+
+    def _block_parts(self, group):
+        """Part IDs of the plan block at `group` (a path such as ["S", "R"]),
+        including every nested sub-block.
+
+        Returns every part in the assembly when there is no plan, when `group`
+        is empty (the root block), or when the path does not resolve -- so
+        callers can intersect with it unconditionally."""
+        plan = getattr(self.assembly, "split_plan", None)
+        all_ids = set(self.assembly.objects)
+        if not plan or not group:
+            return all_ids
+        block = plan
+        for side in group:
+            nxt = block.get(side) if isinstance(block, dict) else None
+            if not isinstance(nxt, dict):
+                break
+            block = nxt
+        parts = block.get("parts") if isinstance(block, dict) else None
+        return set(parts) if parts else all_ids
+
+    @staticmethod
+    def _shade(rgb, factor):
+        """Blend `rgb` toward white (factor > 0) or black (factor < 0)."""
+        if not factor:
+            return tuple(int(c) for c in rgb)
+        if factor > 0:
+            shaded = (c + (255 - c) * factor for c in rgb)
+        else:
+            shaded = (c * (1.0 + factor) for c in rgb)
+        return tuple(max(0, min(255, round(c))) for c in shaded)
+
+    @staticmethod
+    def _side_color(side):
+        """The unshaded hue for a side. Used for TEXT, where the nesting tone
+        is not worth the legibility: a level-1 light green on white is about
+        2:1 contrast in thin glyphs, while the same tone reads fine as a 10px
+        ring or a shaded 3D body. The label already spells the depth out
+        ("Subassembly S-S"), so the tone would be redundant there anyway."""
+        palette = getattr(settings, "subassembly_colors", None) or {}
+        default = {"S": (26, 152, 80), "R": (123, 50, 148)}
+        rgb = palette.get(side) or default.get(side)
+        return tuple(int(c) for c in rgb) if rgb else None
+
+    @classmethod
+    def _group_colors(cls, group):
+        """Outline colour per nesting level of `group`, outermost first.
+
+        Two independent channels: settings.subassembly_colors maps the side
+        ("S"/"R") to a hue, and settings.subassembly_shade_ladder maps the
+        nesting level to a tone. So a step in S.R is framed base green outside
+        (it is in S) and light purple inside (it is the R half of S) -- and a
+        step in S.S gets base green outside and light green inside, which is
+        what keeps two nested blocks of the same side apart."""
+        palette = getattr(settings, "subassembly_colors", None) or {}
+        default = {"S": (26, 152, 80), "R": (123, 50, 148)}
+        ladder = tuple(
+            getattr(settings, "subassembly_shade_ladder", None)
+            or (0.0, 0.40, -0.40, 0.65, -0.65)
+        )
+        out = []
+        for level, side in enumerate(group or []):
+            rgb = palette.get(side) or default.get(side)
+            if rgb is None:
+                continue
+            factor = ladder[min(level, len(ladder) - 1)] if ladder else 0.0
+            out.append(cls._shade(rgb, factor))
+        return out
+
+    @staticmethod
+    def _subassembly_label(group):
+        """Human-readable block name, e.g. "Subassembly S" or "Subassembly S-R",
+        or None for a step that belongs to no subassembly."""
+        if not group:
+            return None
+        return "Subassembly " + "-".join(group)
+
+    def _draw_subassembly_frame(self, canvas, group):
+        """Draw one coloured ring per nesting level around the page.
+
+        The rings are what mark a page as belonging to a subassembly: green for
+        an S block, purple for an R block, outermost ring = outermost block.
+        No-ops for a step outside any block."""
+        colors = self._group_colors(group)
+        if not colors:
+            return
+        from PIL import ImageDraw
+
+        draw = ImageDraw.Draw(canvas)
+        width = int(getattr(settings, "subassembly_border_width", 10))
+        gap = int(getattr(settings, "subassembly_border_gap", 6))
+        w, h = canvas.size
+        for level, color in enumerate(colors):
+            inset = level * (width + gap)
+            # PIL strokes rectangles inward from the given box, so offsetting by
+            # half the width would double-count; inset by the full ring pitch
+            # and let each ring occupy its own band.
+            draw.rectangle(
+                [inset, inset, w - 1 - inset, h - 1 - inset],
+                outline=tuple(color),
+                width=width,
+            )
 
     def _base_ids(self):
         """Part IDs that are never disassembled — the base the rest is built onto.
@@ -80,6 +201,92 @@ class ManualGenerator:
         """
         seq_ids = {s.obj_id for s in self.assembly.sequence}
         return {s.obj_id for s in self.assembly.remaining} - seq_ids
+
+    def _assembly_page_order(self):
+        """Every manual page in assembly order, as descriptors.
+
+        Entries are {"kind": "base"}, {"kind": "step", "step_idx": i} and
+        {"kind": "join", "index": j} (an index into `_split_steps`).  Assembly
+        order is the reverse of disassembly order, so under a subassembly plan
+        the joins land exactly where they belong: after both halves have been
+        built, before the block's prefix parts go on.
+
+        Without a plan this is the base page followed by the steps in descending
+        step_idx -- the ordering compile_manual_pdf has always used."""
+        pages = []
+        if self._base_ids():
+            pages.append({"kind": "base"})
+
+        entries = self._split_steps()
+        if not entries:
+            for step_idx in range(len(self.assembly.sequence) - 1, -1, -1):
+                pages.append({"kind": "step", "step_idx": step_idx})
+            return pages
+
+        seq_idx = {step.obj_id: i for i, step in enumerate(self.assembly.sequence)}
+        for j in range(len(entries) - 1, -1, -1):
+            entry = entries[j]
+            if entry.get("kind") == "join":
+                pages.append({"kind": "join", "index": j})
+                continue
+            # Parts with no Step are the ones the disassembly left behind; the
+            # base page already covers them.
+            step_idx = seq_idx.get(entry.get("part"))
+            if step_idx is not None:
+                pages.append({"kind": "step", "step_idx": step_idx})
+        return pages
+
+    def _page_number(self, kind, key=None):
+        """1-based position of a page in assembly order, or None if absent."""
+        for number, page in enumerate(self._assembly_page_order(), start=1):
+            if page["kind"] != kind:
+                continue
+            if kind == "base":
+                return number
+            if kind == "step" and page["step_idx"] == key:
+                return number
+            if kind == "join" and page["index"] == key:
+                return number
+        return None
+
+    @staticmethod
+    def _join_is_mating(entry):
+        """True when the two halves of a join actually touch.
+
+        The cut score rewards few contacts crossing the cut, so a split whose
+        sides never touch scores well and is common -- 04489 splits into two
+        legs joined only by a crossbar that is part of the prefix. There is no
+        mating to perform on such a page: the halves are independent sub-builds
+        that a later part bridges, and the page has to say so rather than tell
+        the reader to seat one onto the other. Older plans without the count
+        recorded fall back to assuming a real mating."""
+        contacts = entry.get("contact_edges")
+        return contacts is None or contacts > 0
+
+    def _title_parts(self, number, group=None, join_group=None,
+                     join_is_mating=True):
+        """Coloured title segments for a page: the step number in black, then
+        the subassembly it belongs to in that block's colour.
+
+        `join_group` marks a join page, whose title names both halves in their
+        own colours so the reader can match them to the bordered pages that
+        built them."""
+        parts = [(f"Step {number}" if number else "Step", (0, 0, 0))]
+        if join_group is not None:
+            parts.append(("  |  Join " if join_is_mating else "  |  Combine ",
+                          (0, 0, 0)))
+            parts.append(("S", self._side_color("S") or (0, 0, 0)))
+            parts.append((" + ", (0, 0, 0)))
+            parts.append(("R", self._side_color("R") or (0, 0, 0)))
+            label = self._subassembly_label(join_group)
+            if label and join_group:
+                parts.append((f" of {label}", self._side_color(join_group[-1])
+                              or (0, 0, 0)))
+            return parts
+        label = self._subassembly_label(group)
+        if label and group:
+            parts.append((f"  |  {label}", self._side_color(group[-1]) or (0, 0, 0)))
+        return parts
 
     @staticmethod
     def _best_angle(step, skip=()):
@@ -318,9 +525,13 @@ class ManualGenerator:
                     plotter.add_mesh(dot, color="purple", opacity=1.0)
 
             # step.matrices is already in pose frame, so apply it directly.
-            transform = matrices[-1] if len(matrices) else pose
-            red_mesh = moving.tri_mesh.copy().apply_transform(transform)
-            plotter.add_mesh(red_mesh, color="red", opacity=1.0)
+            # With no recorded motion there is no disassembled position to show:
+            # drawing the ghost at `pose` would just stack a red copy on the
+            # blue one. That happens for a part the flat render skipped, which a
+            # subassembly plan can move out of the sequence's last slot.
+            if len(matrices):
+                red_mesh = moving.tri_mesh.copy().apply_transform(matrices[-1])
+                plotter.add_mesh(red_mesh, color="red", opacity=1.0)
 
         cam = convert_angle_pv_pos(angle)
         plotter.camera_position = cam
@@ -404,10 +615,14 @@ class ManualGenerator:
         (step_dir / "instruction.txt").write_text(instruction)
         return instruction
 
-    def _draw_bottom_instruction_text(self, canvas, instruction, region, title=None):
+    def _draw_bottom_instruction_text(self, canvas, instruction, region, title=None,
+                                      title_parts=None):
         """Draw word-wrapped instruction text in the bottom region (x1,y1,x2,y2).
 
-        If title is given, it is drawn as a bold centered header above the body text."""
+        If title is given, it is drawn as a bold centered header above the body
+        text.  `title_parts` -- a list of (text, rgb) segments -- overrides it
+        and is drawn as one centered run, which is how a page states the
+        subassembly it belongs to in that block's colour."""
         from PIL import ImageDraw
 
         x1, y1, x2, _y2 = region
@@ -418,7 +633,14 @@ class ManualGenerator:
         cx = (x1 + x2) // 2
         y = y1 + 10
 
-        if title:
+        if title_parts:
+            total = sum(draw.textlength(t, font=title_font) for t, _ in title_parts)
+            x = cx - total // 2
+            for text, color in title_parts:
+                draw.text((x, y), text, fill=tuple(color), font=title_font)
+                x += draw.textlength(text, font=title_font)
+            y += 30
+        elif title:
             tw = draw.textlength(title, font=title_font)
             draw.text((cx - tw // 2, y), title, fill="black", font=title_font)
             y += 30
@@ -850,6 +1072,162 @@ class ManualGenerator:
         plotter.screenshot(str(save_path))
         plotter.close()
 
+    @staticmethod
+    def _rgb_hex(rgb):
+        r, g, b = (int(c) for c in rgb)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _render_join_composite_to_file(
+        self,
+        s_ids,
+        r_ids,
+        group,
+        pose,
+        save_path,
+        size=(1024, 768),
+        camera_angle="iso1",
+    ):
+        """Render the mating of two subassemblies: both at their joined
+        position, each in its own side colour and nesting tone.
+
+        Deliberately NO red pre-assembly ghost, unlike the per-part step pages.
+        On a step page the red copy is the one part being installed shown at its
+        starting position, which reads clearly.  Here it would be a whole second
+        subassembly floating off to one side, and readers took it for a third
+        body rather than "R, before it goes on".  The two coloured bodies plus
+        the instruction line carry the step on their own.
+
+        `group` is the block path of the join, so each half is coloured one
+        level deeper -- matching the inner ring of the pages that built it."""
+        plotter = pv.Plotter(off_screen=True, window_size=size)
+        plotter.set_background("white")
+
+        pose = np.asarray(pose, dtype=float) if pose is not None else np.eye(4)
+        group = list(group or [])
+        s_color = self._rgb_hex(
+            (self._group_colors([*group, "S"]) or [(26, 152, 80)])[-1]
+        )
+        r_color = self._rgb_hex(
+            (self._group_colors([*group, "R"]) or [(123, 50, 148)])[-1]
+        )
+
+        def posed(obj_id):
+            return self.assembly.objects[obj_id].tri_mesh.copy().apply_transform(pose)
+
+        s_meshes = [posed(i) for i in s_ids if i in self.assembly.objects]
+        r_meshes = [posed(i) for i in r_ids if i in self.assembly.objects]
+        if not s_meshes or not r_meshes:
+            return False
+
+        for mesh in s_meshes:
+            plotter.add_mesh(mesh, color=s_color, opacity=1.0)
+        for mesh in r_meshes:
+            plotter.add_mesh(mesh, color=r_color, opacity=1.0)
+
+        plotter.camera_position = convert_angle_pv_pos(camera_angle)
+        plotter.reset_camera()
+        plotter.screenshot(str(save_path))
+        plotter.close()
+        return True
+
+    def generate_manual_join_offline(self, join_index, ablation="full"):
+        """Manual page for one unified S/R mating.
+
+        A join is not a tree edge -- no part moves on its own -- so it has no
+        Step and no rendered GIF.  The page is built straight from the meshes,
+        in the frame of the page that follows it in assembly order (the first
+        entry of the block's own sequence in disassembly order), so the reader's
+        viewpoint carries over.
+
+        Returns the page path, or None when the join cannot be rendered."""
+        from PIL import Image
+
+        entries = self._split_steps()
+        if join_index >= len(entries):
+            return None
+        entry = entries[join_index]
+        if entry.get("kind") != "join":
+            return None
+
+        s_ids = [i for i in (entry.get("S") or []) if i in self.assembly.objects]
+        r_ids = [i for i in (entry.get("R") or []) if i in self.assembly.objects]
+        if not s_ids or not r_ids:
+            return None
+
+        group = list(entry.get("group") or [])
+        save_dir = self.assembly.output_dir / "manual"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        step_dir = save_dir / f"step_join_{join_index}_offline"
+        step_dir.mkdir(parents=True, exist_ok=True)
+        suffix = "" if ablation == "full" else f"_{ablation}"
+
+        # Share the frame of the neighbouring page: in assembly order the join
+        # is immediately preceded by the last step of the S block, which in
+        # disassembly order is the first 'remove' entry after this join.
+        by_id = {step.obj_id: step for step in self.assembly.sequence}
+        anchor = None
+        for follower in entries[join_index + 1 :]:
+            if follower.get("kind") != "remove":
+                continue
+            anchor = by_id.get(follower.get("part"))
+            if anchor is not None:
+                break
+        pose = anchor.pose if anchor is not None else None
+        if ablation == "no_angle_ranking" or anchor is None:
+            camera_angle = "iso1"
+        else:
+            camera_angle = self._best_angle(anchor) if anchor.images else "iso1"
+
+        base_path = step_dir / f"01_base_render{suffix}.png"
+        ok = self._render_join_composite_to_file(
+            s_ids,
+            r_ids,
+            group,
+            pose,
+            base_path,
+            size=(1024, 768),
+            camera_angle=camera_angle,
+        )
+        if not ok:
+            return None
+
+        s_label = self._subassembly_label([*group, "S"]) or "subassembly S"
+        r_label = self._subassembly_label([*group, "R"]) or "subassembly R"
+        is_mating = self._join_is_mating(entry)
+        if is_mating:
+            instruction = (
+                f"Fit {r_label} ({len(r_ids)} parts) onto {s_label} "
+                f"({len(s_ids)} parts) and seat the two together."
+            )
+        else:
+            instruction = (
+                f"Set {r_label} ({len(r_ids)} parts) and {s_label} "
+                f"({len(s_ids)} parts) in the relative position shown. They do "
+                f"not touch yet; the parts added next join them."
+            )
+        (step_dir / "instruction.txt").write_text(instruction)
+
+        canvas = Image.new("RGBA", (1024, 1024), (255, 255, 255, 255))
+        canvas.paste(Image.open(base_path).convert("RGBA"), (0, 0))
+        self._draw_bottom_instruction_text(
+            canvas,
+            "" if ablation == "no_text" else instruction,
+            region=(0, 768, 1024, 1024),
+            title_parts=self._title_parts(
+                self._page_number("join", join_index), join_group=group,
+                join_is_mating=is_mating,
+            ),
+        )
+        self._draw_subassembly_frame(canvas, group)
+        canvas_rgb = canvas.convert("RGB")
+
+        output_top = save_dir / f"join_{join_index}_manual_offline{suffix}.png"
+        canvas_rgb.save(output_top)
+        if ablation == "full":
+            canvas_rgb.save(step_dir / "final.png")
+            self.assembly.instructions["Manual"].append(str(output_top))
+        return str(output_top)
+
     # Supported ablation flags for generate_manual_offline (used by the
     # manual_validator's per-component evaluation).
     ABLATIONS = ("full", "no_angle_ranking", "no_text", "no_motion")
@@ -908,10 +1286,12 @@ class ManualGenerator:
 
         n_steps = len(self.assembly.sequence)
         base_ids = self._base_ids()
-        # The leftover base parts get an assembly page of their own (Step 1), so
-        # every disassembly step shifts one number up.
-        assembly_step_nr = n_steps - step_idx + (1 if base_ids else 0)
-        step_title = f"Step {assembly_step_nr}"
+        group = list(getattr(step, "subassembly", None) or [])
+        # Numbering comes from the assembly-order page list rather than from
+        # step_idx arithmetic, because a subassembly plan inserts join pages
+        # between the installation steps.
+        assembly_step_nr = self._page_number("step", step_idx)
+        step_title = f"Step {assembly_step_nr}" if assembly_step_nr else "Step"
         # Only the last disassembly step can be the initial-state page, and only
         # when the disassembly left nothing behind for the base page to show.
         is_initial = step_idx == n_steps - 1 and not base_ids
@@ -1026,8 +1406,15 @@ class ManualGenerator:
         if right_panel is not None:
             canvas.alpha_composite(right_panel, (1024 - right_panel.width, 0))
         self._draw_bottom_instruction_text(
-            canvas, instruction, region=(0, 768, 1024, 1024), title=step_title
+            canvas,
+            instruction,
+            region=(0, 768, 1024, 1024),
+            title=step_title,
+            title_parts=self._title_parts(assembly_step_nr, group=group),
         )
+        # Drawn last so the coloured rings sit on top of the composite and the
+        # corner panels, never underneath them.
+        self._draw_subassembly_frame(canvas, group)
         canvas_rgb = canvas.convert("RGB")
 
         suffix = "" if ablation == "full" else f"_{ablation}"
@@ -1091,14 +1478,22 @@ class ManualGenerator:
             )
         (step_dir / "instruction.txt").write_text(instruction)
 
+        # The leftover parts sit in the deepest R block under a subassembly
+        # plan, so the base page is framed like the pages that follow it.
+        base_steps = [
+            step for step in self.assembly.remaining if step.obj_id in set(base_ids)
+        ]
+        group = list(getattr(base_steps[0], "subassembly", None) or []) if base_steps else []
+
         canvas = Image.new("RGBA", (1024, 1024), (255, 255, 255, 255))
         canvas.paste(Image.open(base_path).convert("RGBA"), (0, 0))
         self._draw_bottom_instruction_text(
             canvas,
             "" if ablation == "no_text" else instruction,
             region=(0, 768, 1024, 1024),
-            title="Step 1",
+            title_parts=self._title_parts(self._page_number("base"), group=group),
         )
+        self._draw_subassembly_frame(canvas, group)
         canvas_rgb = canvas.convert("RGB")
 
         output_top = save_dir / f"base_manual_offline{suffix}.png"
@@ -1114,28 +1509,37 @@ class ManualGenerator:
         """Stitch the per-step offline manual pages into one multi-page PDF.
 
         Pages are laid out as a rows x cols grid (default 3 rows x 2 cols = 6
-        steps) on DIN A4 portrait sheets, ordered by assembly step (Step 1
-        first). Assembly order is the reverse of disassembly order, so the pages
-        are collected in descending step_idx, behind the base page (assembly
-        Step 1, the parts the disassembly left behind) when there is one.
+        steps) on DIN A4 portrait sheets, in assembly order (Step 1 first) as
+        given by `_assembly_page_order`: the base page (the parts the
+        disassembly left behind) when there is one, then the installation steps
+        in reverse disassembly order, with a join page wherever a subassembly
+        plan mates two halves.
 
         Reads the per-step PNGs written by generate_manual_offline for the given
-        ablation. Returns the PDF path, or None if no pages were found."""
+        ablation; missing base and join pages are generated here, since neither
+        has a step of its own to be driven from. Returns the PDF path, or None
+        if no pages were found."""
         from PIL import Image
 
         save_dir = self.assembly.output_dir / "manual"
         suffix = "" if ablation == "full" else f"_{ablation}"
 
-        n_steps = len(self.assembly.sequence)
         page_pngs = []
-        base_png = save_dir / f"base_manual_offline{suffix}.png"
-        if not base_png.exists() and self._base_ids():
-            self.generate_manual_base_offline(ablation=ablation)
-        if base_png.exists():
-            page_pngs.append(base_png)
-        for step_idx in range(n_steps - 1, -1, -1):
-            step = self.assembly.sequence[step_idx]
-            png = save_dir / f"{step_idx}_{step.obj_id}_manual_offline{suffix}.png"
+        for page in self._assembly_page_order():
+            if page["kind"] == "base":
+                png = save_dir / f"base_manual_offline{suffix}.png"
+                if not png.exists():
+                    self.generate_manual_base_offline(ablation=ablation)
+            elif page["kind"] == "join":
+                png = save_dir / f"join_{page['index']}_manual_offline{suffix}.png"
+                if not png.exists():
+                    self.generate_manual_join_offline(page["index"], ablation=ablation)
+            else:
+                step = self.assembly.sequence[page["step_idx"]]
+                png = (
+                    save_dir
+                    / f"{page['step_idx']}_{step.obj_id}_manual_offline{suffix}.png"
+                )
             if png.exists():
                 page_pngs.append(png)
         if not page_pngs:

@@ -6,8 +6,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from ATA.assets.save import clear_saved_sdfs
-from ATA.examples.run_multi_plan import ProgressiveQueueSequencePlanner
 
 import settings
 from core.models import Step, extract_gif_frames
@@ -17,6 +15,23 @@ from core.models import Step, extract_gif_frames
 project_base_dir = os.path.abspath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 )
+
+
+def clear_saved_sdfs(obj_dir):
+    """Delete the cached .sdf files sitting next to an assembly's meshes.
+
+    Both backends ship an identical four-line version of this (ATA/assets/save.py,
+    ASAPx/assets/save.py). It lives here instead so the ASAPx path -- which needs
+    it on every plan -- does not import ATA, which is the optional legacy backend
+    and is often not checked out at all.
+    """
+    for file in os.listdir(obj_dir):
+        file_path = os.path.join(obj_dir, file)
+        if file_path.endswith(".sdf"):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
 
 
 # Eval object active for the duration of a get_assembly_plans_ASAP call.
@@ -195,14 +210,46 @@ def choose_nodes_via_llm(
     return indices, response_text
 
 
-def _extract_step_details(tree):
+def _extract_step_details(tree, sequence=None):
     """Walk the solution path in the tree and return per-step pose and parts_fix.
 
-    Targets the deepest feasible node: a size-1 leaf on full success, or the
-    deepest feasible prefix when the planner got stuck. Tie-break matches
-    SequencePlanner.find_partial_sequence so step_details and the rendered
-    sequence follow the same spine.
+    When `sequence` is given, the walk follows EXACTLY that removal order from
+    the root. This matters whenever the chosen sequence is not the first leaf
+    the node iteration happens to reach -- which is the normal case as soon as
+    an optimizer picks the sequence (optimize_scored) or a subassembly plan
+    reorders it (optimize_constrained). Walking the wrong path silently pairs
+    each part with a pose validated for a state that never occurs in the plan,
+    and leaves any part absent from that path with no pose at all, which the
+    renderer then falls back to identity for.
+
+    Without `sequence` it targets the deepest feasible node: a size-1 leaf on
+    full success, or the deepest feasible prefix when the planner got stuck.
+    Tie-break matches SequencePlanner.find_partial_sequence.
     """
+    if sequence:
+        root = next((n for n in tree.nodes if tree.in_degree(n) == 0), None)
+        if root is not None:
+            steps = []
+            node = root
+            for part in sequence:
+                child = tuple(p for p in node if p != part)
+                if not tree.has_edge(node, child):
+                    break
+                sim_info = tree.edges[node, child].get("sim_info") or {}
+                if not sim_info.get("feasible"):
+                    break
+                pose = sim_info["pose"]
+                steps.append(
+                    {
+                        "part": sim_info["part_move"],
+                        "parts_fix": sim_info["parts_fix"] or [],
+                        "pose": pose.tolist() if pose is not None else None,
+                        "rotated": pose is not None,
+                    }
+                )
+                node = child
+            if steps:
+                return steps
     # Prefer a full solution (first size-1 feasible leaf), matching
     # SequencePlanner.find_sequence so step_details and stats['sequence'] agree.
     leaf_node = None
@@ -379,7 +426,22 @@ class SequencePlanner:
         return self.assembly.sequence, self.assembly.remaining
 
     def _apply_step_details(self, step_details):
-        for step, detail in zip(self.assembly.sequence, step_details, strict=False):
+        """Copy per-step planner output (pose, reorientation flag, held parts,
+        tool) onto the Steps.
+
+        Matched by part id rather than by position: under a subassembly plan
+        ``assembly.sequence`` is in split order while ``step_details`` follows
+        the tree path, so zipping them would assign each step another part's
+        pose. Details with no "part" key (older cached sequence.json files) fall
+        back to the positional pairing."""
+        by_id = {step.obj_id: step for step in self.assembly.sequence}
+        for position, detail in enumerate(step_details):
+            part_id = detail.get("part")
+            step = by_id.get(part_id)
+            if step is None:
+                if part_id is not None or position >= len(self.assembly.sequence):
+                    continue
+                step = self.assembly.sequence[position]
             step.pose = detail.get("pose")
             step.rotated = detail.get("rotated", False)
             step.parts_fix = detail.get("parts_fix", [])
@@ -424,6 +486,37 @@ class SequencePlanner:
             if tool is not None:
                 detail["tool"] = tool
         return step_details
+
+    def _apply_split_plan(self, split_plan, split_steps):
+        """Attach the recursive subassembly plan to the assembly and tag every
+        ``Step`` with its block path.
+
+        ``split_steps`` is the flattened plan (see
+        ASAPx/plan_sequence/optimizer/split_plan.py). Its 'remove' entries map
+        one-to-one onto the disassembly sequence; its 'join' entries are the
+        unified S/R matings, which have no Step because they are not tree edges
+        — they stay on ``assembly.split_steps`` for the renderer and the manual
+        to pick up.
+
+        Safe to call with (None, []): every Step keeps its empty default, which
+        is what every non-divide run produces."""
+        self.assembly.split_plan = split_plan
+        self.assembly.split_steps = list(split_steps or [])
+        if not split_steps:
+            return
+
+        groups = {
+            entry["part"]: list(entry.get("group") or [])
+            for entry in split_steps
+            if entry.get("kind") == "remove" and entry.get("part") is not None
+        }
+        for step in self.assembly.sequence:
+            step.subassembly = list(groups.get(step.obj_id, []))
+        # The trailing part lives in assembly.remaining, not in the sequence,
+        # but it still belongs to a block (the deepest R) and the manual needs
+        # to frame its base page accordingly.
+        for step in self.assembly.remaining:
+            step.subassembly = list(groups.get(step.obj_id, []))
 
     def _apply_tool_decisions(self, tool_decisions):
         """Write cached tool names onto every ``Step`` in the assembly sequence."""
@@ -649,6 +742,19 @@ class SequencePlanner:
 
         self._pre_plan_tool_check(args)
 
+        # ATA is the optional legacy backend: imported here rather than at module
+        # scope so the whole pipeline keeps working with the submodule
+        # uninitialised. Only --seq-planner ATA reaches this point.
+        try:
+            from ATA.examples.run_multi_plan import ProgressiveQueueSequencePlanner
+        except ImportError as exc:
+            raise ImportError(
+                "--seq-planner ATA needs the optional ATA backend, which is not "
+                "installed. Initialise it with "
+                "`git submodule update --init --recursive ATA`, or plan with the "
+                "default --seq-planner ASAP."
+            ) from exc
+
         seq_planner = ProgressiveQueueSequencePlanner(asset_folder, assembly_dir)
         seq_status, sequence, _seq_count, _t_plan = seq_planner.plan_sequence(
             "bfs",
@@ -701,6 +807,9 @@ class SequencePlanner:
                 self.update_sequence(data["sequence"])
                 self._apply_step_details(data.get("steps", []))
                 self._apply_tool_decisions(data.get("tool_decisions", {}))
+                self._apply_split_plan(
+                    data.get("split_plan"), data.get("split_steps") or []
+                )
                 # Restore planning-failure evidence from the cached log dir so
                 # failure-mode feedback can be regenerated on re-runs without
                 # re-planning. Mirrors the same load in the non-cached branch.
@@ -900,9 +1009,31 @@ class SequencePlanner:
             f"Final result for assembly {args.id}: {'Success' if assemblable else 'Failure'} | Sequence: {sequence}"
         )
 
-        step_details = _extract_step_details(tree) if plan_sequence else []
+        # plan_sequence, not `sequence`: the walk needs the exact tree path the
+        # planner settled on, so each part is paired with the pose validated for
+        # the state it is actually removed from.
+        step_details = (
+            _extract_step_details(tree, plan_sequence) if plan_sequence else []
+        )
         tool_decisions = self._load_tool_decisions()
         self._annotate_steps_with_tool(step_details, tool_decisions)
+        split_plan = stats.get("split_plan")
+        split_steps = stats.get("split_steps") or []
+        # The manual is told in subassembly order (build R, build S, join them,
+        # then the prefix parts). The renderer keeps following stats["sequence"]
+        # -- a real tree path -- so only the Step ordering changes here, and the
+        # per-part artifacts it reads (GIFs, path matrices) are looked up by
+        # obj_id, not by position.
+        if split_steps:
+            split_sequence = stats.get("split_sequence") or []
+            if set(split_sequence) == set(sequence):
+                sequence = list(split_sequence)
+            elif split_sequence:
+                print(
+                    f"[{args.id}] split_sequence covers "
+                    f"{len(set(split_sequence))} parts but the plan has "
+                    f"{len(set(sequence))}; keeping the flat order."
+                )
         with open(seq_file_path, "w") as f:
             json.dump(
                 {
@@ -910,6 +1041,8 @@ class SequencePlanner:
                     "assemblable": assemblable,
                     "steps": step_details,
                     "tool_decisions": tool_decisions,
+                    "split_plan": split_plan,
+                    "split_steps": split_steps,
                 },
                 f,
             )
@@ -919,6 +1052,7 @@ class SequencePlanner:
 
         self.update_sequence(sequence)
         self._apply_step_details(step_details)
+        self._apply_split_plan(split_plan, split_steps)
         return assemblable
 
     def get_assembly_plans_ASAP_archive(self, args):
@@ -1025,7 +1159,12 @@ class SequencePlanner:
             f"Final result for assembly {args.id}: {'Success' if assemblable else 'Failure'} | Sequence: {sequence}"
         )
 
-        step_details = _extract_step_details(tree) if plan_sequence else []
+        # plan_sequence, not `sequence`: the walk needs the exact tree path the
+        # planner settled on, so each part is paired with the pose validated for
+        # the state it is actually removed from.
+        step_details = (
+            _extract_step_details(tree, plan_sequence) if plan_sequence else []
+        )
         tool_decisions = self._load_tool_decisions()
         self._annotate_steps_with_tool(step_details, tool_decisions)
         with open(seq_file_path, "w") as f:
@@ -1068,6 +1207,7 @@ class SequencePlanner:
                 del sys.modules[_mod]
         from ASAPx.plan_sequence.play_logged_plan import (
             play_logged_plan,
+            play_split_plan,
             play_subassembly_split,
         )
 
@@ -1234,18 +1374,33 @@ class SequencePlanner:
         shutil.rmtree(str(render_iso3), ignore_errors=True)
         shutil.rmtree(str(render_iso4), ignore_errors=True)
 
-        # Subassembly-split render: visualise the divide-optimizer split (if one
-        # was persisted). Renders R separating from S plus each subassembly's
-        # internal disassembly into storage_dir/subassembly/.
+        # Subassembly render: visualise the split decomposition (if one was
+        # persisted). With a recursive plan every level is rendered into its own
+        # subdirectory; with only the flat divide-optimizer cut, just that one.
         stats_file = self.assembly.storage_dir / "log" / "stats.json"
         divide_split = None
+        split_plan = None
         if stats_file.exists():
             try:
                 with open(stats_file) as f:
-                    divide_split = json.load(f).get("divide_split")
+                    _stats = json.load(f)
+                divide_split = _stats.get("divide_split")
+                split_plan = _stats.get("split_plan")
             except (json.JSONDecodeError, OSError):
-                divide_split = None
-        if divide_split:
+                divide_split = split_plan = None
+        if split_plan:
+            play_split_plan(
+                asset_folder,
+                assembly_dir,
+                split_plan,
+                plan_sequence,
+                tree,
+                result_dir=str(self.assembly.storage_dir / "subassembly"),
+                connect_path=_connect_path,
+                camera_pos=[1.25, -1.5, 1.5],
+                camera_lookat=[-1.0, 1.0, 0.0],
+            )
+        elif divide_split:
             play_subassembly_split(
                 asset_folder,
                 assembly_dir,

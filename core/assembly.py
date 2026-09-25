@@ -161,6 +161,14 @@ class Assembly:
         self.remaining = set()
         self.collisions = {}
         self.planning_failures = None
+        # Recursive subassembly decomposition of this assembly's sequence, or
+        # None when the run produced no split plan. `split_plan` is the nested
+        # block dict from ASAPx/plan_sequence/optimizer/split_plan.py;
+        # `split_steps` is its flattened form, which additionally carries the
+        # 'join' entries (unified S/R matings) that have no Step of their own
+        # because they are not tree edges.
+        self.split_plan = None
+        self.split_steps = []
 
         if self.openai_api_key is None:
             if evaluation and evaluation.openai_api_key:

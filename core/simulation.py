@@ -11,9 +11,6 @@ import numpy as np
 import redmax_py as redmax
 import trimesh
 
-# from ATA.examples.test_multi_sim import get_xml_string
-from ATA.examples.run_joint_plan import PhysicsPlanner, get_xml_string
-from ATA.utils.renderer import SimRenderer
 from tqdm import tqdm
 
 # This file lives at <repo_root>/core/simulation.py, so the repo root
@@ -21,6 +18,33 @@ from tqdm import tqdm
 project_base_dir = os.path.abspath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 )
+
+# ATA is the optional legacy backend, so the gravity checks below import it when
+# they run rather than at module scope -- importing it here would make every
+# entry point (including ASAPx-only planning) fail with ModuleNotFoundError when
+# the submodule is not checked out.
+_ATA_HINT = (
+    "This check uses the optional ATA backend, which is not installed. "
+    "Initialise it with `git submodule update --init --recursive ATA`."
+)
+
+
+def _load_ata_joint_plan():
+    """Return (PhysicsPlanner, get_xml_string) from ATA, or raise with a hint."""
+    try:
+        from ATA.examples.run_joint_plan import PhysicsPlanner, get_xml_string
+    except ImportError as exc:
+        raise ImportError(_ATA_HINT) from exc
+    return PhysicsPlanner, get_xml_string
+
+
+def _load_ata_renderer():
+    """Return ATA's SimRenderer, or raise with a hint."""
+    try:
+        from ATA.utils.renderer import SimRenderer
+    except ImportError as exc:
+        raise ImportError(_ATA_HINT) from exc
+    return SimRenderer
 
 
 class ContactTree:
@@ -64,6 +88,8 @@ class Simulation:
 
     # See how assembly behaves under gravity
     def test_gravity(self, show=False):
+        PhysicsPlanner, get_xml_string = _load_ata_joint_plan()
+        SimRenderer = _load_ata_renderer()
 
         print(f"Testing gravity for assembly in {self.assembly_dir} ...")
         # USING RUN_JOINT_PLAN VERSION OF XML STRING
@@ -103,6 +129,8 @@ class Simulation:
         SimRenderer.replay(sim, record=False)
 
     def test_stable(self, show=False):
+        PhysicsPlanner, _get_xml_string = _load_ata_joint_plan()
+
         print("\nTesting stability under gravity")
 
         self.tree.draw()

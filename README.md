@@ -146,12 +146,20 @@ python main.py <test_type> --id <assembly_id> [--dir <data_dir>] [options]
 ```
 
 `--id` accepts a single ID (`00042`) or an inclusive range (`00010-00050`).
-`--dir` is resolved under `assets/` and defaults to `data/multi_assembly`.
+`--dir` is resolved under `assets/` and defaults to `data`.
 
-Plan, render, and generate a manual for one assembly:
+One test assembly, `04489`, ships with the repository in `assets/data/`, and it
+is what an omitted `--id` falls back to. A fresh checkout therefore runs the
+whole pipeline without downloading a dataset first:
 
 ```bash
-python main.py test_pipeline --id 00000
+python main.py test_pipeline
+```
+
+which is the same as spelling both out:
+
+```bash
+python main.py test_pipeline --id 04489 --dir data
 ```
 
 Run the full pipeline over a range, in parallel:
@@ -163,7 +171,7 @@ python main.py test_pipeline_batch --id 00000-00100
 Re-render an already-planned assembly from its saved plan:
 
 ```bash
-python main.py test_render --id 00000 --storage-dir assets/output/<timestamp>/00000
+python main.py test_render --id 04489 --storage-dir assets/output/<timestamp>/04489
 ```
 
 For `test_pipeline`, the `-x` flag selects which stages run: `g` for gravity,
@@ -173,14 +181,14 @@ prefixing the string with `x` inverts the selection, running everything except
 the listed stages.
 
 ```bash
-python main.py test_pipeline --id 00000 -x gc    # only gravity and collisions
-python main.py test_pipeline --id 00000 -x xim   # everything except instructions and manuals
+python main.py test_pipeline -x gc    # only gravity and collisions
+python main.py test_pipeline -x xim   # everything except instructions and manuals
 ```
 
 To choose a planner and generator:
 
 ```bash
-python main.py test_pipeline --id 00000 --generator heur-out --planner dfs --max-grippers 2
+python main.py test_pipeline --generator heur-out --planner dfs --max-grippers 2
 ```
 
 The subcommands are grouped by purpose across three handler modules:
@@ -188,7 +196,7 @@ The subcommands are grouped by purpose across three handler modules:
 | Group | Module | Subcommands |
 |---|---|---|
 | Pipeline | [run_pipeline.py](run_pipeline.py) | `test_pipeline`, `test_pipeline_batch`, `test_render` |
-| Data generation | [run_data.py](run_data.py) | `data_assembly_time`, `train_heuristic_weights`, `data_heuristic_validation`, `data_manual_validation`, `data_validate_cost`, `data_filter_assemblies`, `test_convex_decomp` |
+| Data generation | [run_data.py](run_data.py) | `data_assembly_time`, `data_sequence_runtime`, `train_heuristic_weights`, `data_heuristic_validation`, `data_manual_validation`, `data_validate_cost`, `data_filter_assemblies`, `test_convex_decomp`, `test_tool_needed`, `collect_tool_data`, `collect_tool_axes` |
 | Diagnostics | [run_debug.py](run_debug.py) | `test_divide_optimizer`, `test_param_sweep`, `test_collision`, `test_PCA`, `test_tools`, `test_tool_naming`, `test_gravity`, `test_collision_resolver`, `test_collision_graph_batch`, `test_archive_ASAP` |
 
 Run `python main.py --help` for the full list of subcommands and flags.
@@ -227,6 +235,7 @@ For reproducibility, every run copies its `settings.py` and writes a
 ```
 AssembleX/
 ├── main.py                 # CLI entry point and dispatcher
+├── setup.sh                # convenience installer (install steps 1-3)
 ├── run_pipeline.py         # pipeline subcommand handlers
 ├── run_data.py             # data-generation subcommand handlers
 ├── run_debug.py            # diagnostic subcommand handlers
@@ -238,9 +247,11 @@ AssembleX/
 │   ├── sequence_planner.py # SequencePlanner (wraps ASAPx / ATA)
 │   ├── simulation.py       # Simulation, ContactTree (collision, gravity)
 │   ├── feedback_generator.py  # LLM/VLM manual and instruction generation
+│   ├── llm.py              # LLM/VLM client and response caching
 │   ├── manual_generator.py    # manual page rendering
 │   ├── manual_validator.py    # manual-fidelity validation
 │   ├── tool_analyzer.py    # per-part tool decisions and poses
+│   ├── tool_eval.py        # tool-decision evaluation against human labels
 │   ├── renderer.py         # GIF stitching
 │   ├── collision_checker.py   # collision queries
 │   ├── perturbation.py     # geometric collision resolver
@@ -250,26 +261,42 @@ AssembleX/
 ├── ASAPx/                  # active planner backend (fork of ASAP) and RedMax sim
 ├── ATA/                    # legacy planner backend (fork of Assemble-Them-All)
 ├── assets/                 # data, tools, prompts, outputs, caches
+│   ├── data/04489/         # the test assembly shipped with the repository
+│   └── tools/              # tracked tool catalog (screwdrivers, allen key)
+├── tests/                  # pytest suite
 ├── environment.yml         # conda environment (name: assemblex, python 3.11)
+├── pyproject.toml          # packaging, ruff and mypy configuration
 └── CLAUDE.md               # detailed codebase map
 ```
 
 ## Examples
 
-Sample assemblies ship under `assets/data/multi_assembly/<id>/`, each a folder
-of `.obj` part meshes, so the commands above run without extra setup. A catalog
-of tools (screwdrivers, wrenches, allen keys) lives under `assets/tools/` and
-feeds the tool-decision and tool-feasibility steps. Planning and rendering write
-per-step disassembly GIFs into each assembly's output directory, and the
-`data_assembly_time` benchmark additionally produces per-assembly and
-cross-assembly cost charts.
+An assembly is a folder of `.obj` part meshes under `assets/<dir>/<id>/`, where
+`<dir>` is what `--dir` selects (default `data`). One assembly is tracked in this
+repository as the test case: `04489`, a seven-part assembly in `assets/data/`
+taken from the ASAP multi-part dataset. It is small enough to plan quickly and
+still exercises the subassembly path, since it splits into two legs joined only
+by a crossbar that comes off first. Omitting `--id` selects it. Only its part
+meshes and its `normalization.json` and `contact_graph.json` are tracked; the
+`.sdf` collision caches are generated on demand next to the meshes. For anything
+beyond that single example, point `--dir` at your own meshes or at an ASAP
+dataset (see the download links in
+[ASAPx/README.md](ASAPx/README.md)). The tool catalog under `assets/tools/` is
+tracked and ships with a Phillips-head screwdriver, a hex torque screwdriver,
+and a hex allen key; it feeds the tool-decision and tool-feasibility steps.
+Planning and rendering write per-step disassembly GIFs into each assembly's
+output directory, and the `data_assembly_time` benchmark additionally produces
+per-assembly and cross-assembly cost charts.
 
 ## Contributing
 
 Contributions are welcome through issues and pull requests. The code follows
-[ruff](https://docs.astral.sh/ruff/) with `line-length = 120` and the `E`, `F`,
-and `I` rule sets (see `pyproject.toml`); run `ruff check .` before submitting,
-and keep emojis and decorative formatting out of code and markdown. Branch off
+[ruff](https://docs.astral.sh/ruff/) with `line-length = 88` and the rule sets
+configured in `pyproject.toml` (pycodestyle, pyflakes, isort, pep8-naming,
+pyupgrade, bugbear, and others); the `ASAPx/` and `ATA/` submodules are
+excluded. Run `ruff check .` before submitting, and keep emojis and decorative
+formatting out of code and markdown. The development extras (`ruff`, `mypy`,
+`pytest`, `pre-commit`) install with `pip install -e ".[dev]"`. Branch off
 `main`, keep changes focused, and open a pull request with a clear description.
 Read [CLAUDE.md](CLAUDE.md) first: it documents the conventions that are easy to
 trip over, such as the ASAPx/ATA module-eviction rule and the use of `tree.pkl`

@@ -574,7 +574,17 @@ def _base_page_offset(assembly) -> int:
 def _assembly_step_nr(step_idx, assembly) -> int:
     """Convert a disassembly index into the assembly step number the manual
     displays.  sequence[0] is the LAST assembly step, so step 0 of disassembly
-    becomes Step N (where N = len(sequence)), offset by the base page."""
+    becomes Step N (where N = len(sequence)), offset by the base page.
+
+    Under a subassembly plan the manual also prints a join page wherever two
+    halves are mated, so the arithmetic no longer holds; ask the generator for
+    the page's actual position instead and only fall back to it when there is
+    no plan."""
+    manual = getattr(assembly, "manual", None)
+    if manual is not None and hasattr(manual, "_page_number"):
+        number = manual._page_number("step", step_idx)
+        if number is not None:
+            return number
     n_steps = len(getattr(assembly, "sequence", []) or []) or (step_idx + 1)
     return n_steps - step_idx + _base_page_offset(assembly)
 

@@ -96,6 +96,17 @@ Every subcommand resolves the assembly IDs via `resolve_ids(args.id, dir)`
 (supports `"00010-00050"` range strings) and instantiates a shared `Eval`
 that tracks an LLM token budget across all assemblies.
 
+`--dir` defaults to `data` (resolved under `assets/`), and an omitted `--id`
+falls back to `DEFAULT_ASSEMBLY_ID = "04489"`, the one assembly tracked in the
+repository (`assets/data/04489/`, whitelisted in `.gitignore` against the
+blanket `assets/*` rule; its `.sdf` caches are not tracked and regenerate on
+demand). `wants_default_assembly` gates that fallback: it is skipped for
+`NO_ASSEMBLY_TESTS` (`collect_tool_data` / `collect_tool_axes`, which read only
+`--data-dir`) and whenever `--data-dir` is given, because `data_assembly_time`
+and `data_sequence_runtime` re-plot from it and return before touching
+`test_eval.assemblies`. If the id is missing from the resolved dir the run
+continues with no assemblies, as before, after printing why.
+
 ## Core abstractions
 
 | Class | File | Role |
@@ -149,6 +160,14 @@ Composed of three plug-in registries (each is a dict in their package
     by fusing each side into a unified rigid body (`verify_separation`) and
     scanning the 6 world-axis directions. The top verified split is persisted
     into `stats['divide_split']` for the renderer.
+  - `split_plan.py` — the **recursive** subassembly plan
+    (`prefix -> unified split -> S -> R`, where S and R are planned the same
+    way). `build_split_plan` reuses the DivideOptimizer's obstruction graph,
+    searching each block under a `restrict_parts` universe, so no re-planning
+    is involved. `split_order_constraint` turns a plan into a predicate over
+    sequences, `derive_split_sequence` builds the plan's own order, and
+    `flatten_split_plan` emits the ordered step list including the `join`
+    entries. See "Subassembly plan" below.
   - `compare.py` — `compare_with_split(tree, asset_folder, assembly_dir, split, ...)`
     builds a "split sequence" from a chosen `(S, R)` (prefix taken from the
     original sequence's parts not in `S∪R`, then a unified-split step, then
@@ -164,9 +183,11 @@ Composed of three plug-in registries (each is a dict in their package
     trajectory). Run as `python ASAPx/plan_sequence/optimizer/plot_weight_history.py`.
 
 `seq_plan(...)` runs the chosen generator+planner to build the tree, then
-(when `seq_optimizer='divide'`) wires `BaseSequenceOptimizer.optimize_scored`
-with the divide optimizer's split as a guide, and persists the top verified
-split into `stats['divide_split']`.
+(when `seq_optimizer='divide'`) calls `BaseSequenceOptimizer.optimize_scored`,
+which picks the minimum-cost valid sequence; the divide optimizer's split is
+passed in for the debug diagnostic only and does **not** steer that choice.
+The top verified split is persisted into `stats['divide_split']`, and
+`_build_subassembly_plan` then builds the recursive plan on top of it.
 
 ### Heuristic cost function — [ASAPx/plan_sequence/planner/heuristic.py](ASAPx/plan_sequence/planner/heuristic.py)
 `HeuristicDFASequencePlanner._cost_child` computes
@@ -183,6 +204,98 @@ Weights are loaded by `_load_weights()` which branches on
   duplicated in `compare.py:CostComputer` — keep the two in sync when
   editing.**
 
+## Subassembly plan — `prefix -> unified split -> S -> R`
+
+Enabled by `--seq-optimizer divide` plus `settings.subassembly_plan` (default
+on). Built by `_build_subassembly_plan` in
+[ASAPx/plan_sequence/run_seq_plan.py](ASAPx/plan_sequence/run_seq_plan.py),
+which runs **after** the flat sequence has been chosen and `divide_split`
+persisted, so a failure anywhere in it leaves the run exactly as it was.
+
+1. `build_split_plan` cuts the assembly into `(prefix, S, R)`, then recurses
+   into S and R. Each block's cut comes from
+   `DivideOptimizer.find_locally_free_subassemblies(restrict_parts=<block>)` —
+   the obstruction graph is built once on the full tree and the search universe
+   is narrowed per block, so parts outside it are correctly treated as already
+   removed. Cuts are then physically verified with `verify_locally_free`.
+   A block's `prefix` is the parts in neither side: the DivideOptimizer's
+   propagated ("diminished") cuts often only exist after a few parts come off,
+   and those parts become the prefix.
+
+   With `settings.subassembly_sweep_states` (default on) the per-block search
+   is `sweep_sequence_states` instead: the DFS re-runs at **every prefix state**
+   of the block, not just the whole block. This is what finds a subassembly
+   locked inside the block — `_propagate_to_subsequent_steps` cannot, because
+   it only shrinks cuts that were already free initially, and a cut blocked at
+   the initial state is dropped by the DFS before propagation sees it. Both are
+   pooled, so the swept candidate set is a strict superset.
+
+   Two things keep this cheap. Scores use a **common basis** (`score_scope`,
+   the block's full part set) so cuts found at different states are comparable
+   — without it, balance normalised per state makes a `|S|=3 |R|=1` cut at a
+   small state outrank real cuts. And the root block carries `divide_split` in
+   as `known_verified`, so only candidates that outrank it reach physics.
+   `verify_separation` depends only on `(S, R)`, never on the state a cut was
+   found in, so nothing about verification scales with the number of states.
+
+   Measured on a 17-part assembly: the sweep adds ~0.4s of graph work against
+   ~12 min of sequence planning, and 313 extra candidate cuts. In practice
+   those extra cuts rank *below* the initial-state ones (a cut needing a prefix
+   has smaller sides, hence lower balance on the common basis) — first
+   sweep-only cut lands at rank 16, outside the default `top_k=10`. So today it
+   costs nothing and changes nothing on assemblies whose root already splits
+   well; it is there for the ones whose root does not. Raising
+   `subassembly_verify_top_k` is the knob that actually brings them into play.
+   Depth and block size are bounded by `subassembly_max_depth` /
+   `subassembly_min_parts`; a side smaller than `MIN_SIDE_PARTS` (2) is never
+   called a subassembly.
+2. The plan defines a block **order**: prefix before S∪R, S before R, at every
+   level. Two ways to realise it, recorded in `stats['split_sequence_source']`:
+   - `'tree'` — `BaseSequenceOptimizer.optimize_constrained` found a real
+     root-to-leaf path of the tree that respects the order. `stats['sequence']`
+     is replaced with it (the old one is kept as `stats['flat_sequence']`), so
+     the renderer, per-step poses and the arm pipeline all follow the same
+     order the manual tells.
+   - `'derived'` — no explored path respects it, which is the common case on
+     larger assemblies: a block ordering is a narrow slice of the orderings a
+     budget-limited search visits. The order is then assembled from the plan by
+     `derive_split_sequence`, and **`stats['sequence']` is left untouched** —
+     the renderer keeps following a valid tree path while only the manual reads
+     the split order.
+3. Persisted: `stats['split_plan']` (nested block dict),
+   `stats['split_steps']` (flattened, including the `join` entries), and
+   `stats['split_sequence']`.
+
+A `join` step — R separating from S as one rigid body — is **not a tree edge**,
+so it has no `Step` and no per-step GIF. It lives only in `split_steps`, with
+the verified world-axis separation direction attached as metadata, and the
+manual renders its page directly from the meshes: both halves seated, each in
+its side colour, with **no** red pre-assembly ghost. (On a per-part step page
+the red copy is one part at its starting position and reads clearly; for a
+whole subassembly it reads as a third body instead.) Nothing currently draws
+`direction`.
+
+Manual page framing: the hue says which side (`subassembly_colors` — green S,
+purple R), the tone says how deep (`subassembly_shade_ladder`, alternating
+lighter/darker per nesting level, so two nested S blocks are not the same green
+twice). One ring per level, outermost = outermost block. Title text uses the
+full-strength hue rather than the nesting tone — thin glyphs in a level-1 tone
+fall to about 2:1 contrast on white, and the label already spells the depth out
+("Subassembly S-S").
+
+Downstream: `SequencePlanner._apply_split_plan` puts the plan on
+`assembly.split_plan` / `assembly.split_steps` and tags every `Step` with its
+block path (`Step.subassembly`, e.g. `["S", "R"]`). When a plan is present,
+`assembly.sequence` is ordered by `split_sequence` — safe because the per-part
+artifacts it reads (GIFs, path matrices) are looked up by `obj_id`, not by
+position. `_apply_step_details` matches by part id for the same reason.
+
+Caveat: each step's feasibility was verified with the *other* side still
+present, which is strictly more constrained than the split narrative, so
+collisions are covered. Sub-assembly **stability** in isolation is not
+re-checked — `verify_separation` establishes separability, not that each half
+stands on its own.
+
 ## Storage / outputs
 
 Each assembly has a `storage_dir` (under `assets/output/<timestamp>/<id>/` by
@@ -193,6 +306,9 @@ storage_dir/
 ├── log/
 │   ├── tree.pkl              # the planning DiGraph
 │   ├── stats.json            # success, sequence, divide_split, timings, cli_args
+│                             # + split_plan / split_steps / split_sequence
+│                             #   / split_sequence_source / flat_sequence
+│                             #   (subassembly plan; see above)
 │                             # + timing_breakdown / timing_counts (planner's
 │                             #   per-check buckets; worker CPU-seconds)
 │   ├── setup.json            # the planner kwargs
@@ -202,7 +318,9 @@ storage_dir/
 ├── paths/                    # per-step recorded motion (npy frames)
 ├── 0_<obj>.gif, …            # primary-view per-step disassembly GIFs
 ├── 0_<obj>_opposite.gif      # opposite-view per-step GIFs
-├── subassembly/              # divide-optimizer renders (split.gif + S_*/R_* internals)
+├── subassembly/              # divide-optimizer renders, one dir per split block
+│   └── root[.S[.R]]/         #   split.gif + S_*/R_* internals per block
+├── manual/                   # manual pages; join_<i>_manual_offline.png per join
 ├── sequence_runtime/         # data_sequence_runtime (in the run's output dir)
 ├── obstruction_graph.png     # test_divide_optimizer diagnostic
 ├── subassemblies/            # test_divide_optimizer per-partition screenshots
@@ -267,7 +385,7 @@ Single source of truth for runtime tuning. Notable keys (all already in
 
 | Goal | Run |
 |---|---|
-| Plan + render a single assembly end-to-end | `python main.py test_pipeline --id 00100 --dir multi_assembly` |
+| Plan + render the shipped assembly end-to-end | `python main.py test_pipeline` (same as `--id 04489 --dir data`) |
 | Re-render an already planned assembly | `python main.py test_render --id 00100 --storage-dir <path>` |
 | Inspect the DivideOptimizer for one tree | `python main.py test_divide_optimizer --id 00100 --storage-dir <path>` |
 | Batch validate (no re-planning) | `python main.py data_manual_validation --id 00000-00200` |
