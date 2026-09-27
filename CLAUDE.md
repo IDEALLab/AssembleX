@@ -45,16 +45,25 @@ by purpose:
     stacked-bar PNGs + a cross-assembly mean chart. Includes `heuristic_trained`
     (reads the Optuna weights) and `heuristic+optimizer` (reuses the heuristic
     tree, applies the divide split, re-plans each subassembly standalone in
-    parallel).
+    parallel). All RUNS of an assembly share one candidate-check cache (see
+    "Candidate-check cache"), so each RUN only simulates what no earlier RUN
+    reached.
   - `train_heuristic_weights` — Optuna study that tunes
-    `HeuristicDFASequencePlanner` weights against arm-pipeline `total_s`. Writes
-    `assets/heuristic_weights_optuna.json` + history.
+    `HeuristicDFASequencePlanner` weights against arm-pipeline `total_s`,
+    as a time ratio against a per-assembly baseline. Writes
+    `assets/heuristic_weights_optuna.json` + history. See "Heuristic-weight
+    training".
+  - `data_heuristic_weights_eval` — tests trained weights on held-out
+    assemblies against the reference weights and against the gen:heur-out
+    baseline (paired time ratios, bootstrap CI, Wilcoxon, failures, by size
+    band).
   - `data_sequence_runtime` — sequence-finder **compute**-time benchmark
     (as opposed to `data_assembly_time`, which measures predicted *robot*
     time). Plans each assembly once with the heuristic planner under the
     Optuna-trained weights, divide optimizer off, `--plan-arm` forced on and
     rendering off — the same conditions as `assets/results/timing_final` —
-    into a fresh per-assembly dir so every run is a cold plan. Records
+    into a fresh per-assembly dir so every run is a cold plan (it also forces
+    the candidate-check cache off: replayed physics costs no compute). Records
     wall-clock plus the planner's own timing buckets and emits
     `parts_vs_runtime`, `parts_vs_runtime_breakdown`, `runtime_per_assembly`
     (PNG + PDF) and `sequence_runtime_summary.{json,txt}`. `--data-dir`
@@ -84,7 +93,9 @@ by purpose:
     `test_archive_ASAP` — visual checks and baseline runs.
 
 Shared CLI helpers (`resolve_ids`, `create_output_directory`, the batch-summary
-writers) live in **[run_common.py](run_common.py)**. `resolve_ids` also does
+writers) live in **[run_common.py](run_common.py)**. `resolve_ids` accepts a
+single id, a range (`"00010-00050"`) or an explicit comma-separated list
+(`"04600,03094"`, e.g. a fixed train/test split). It also does
 the size-based selection for range IDs: `--min-parts` / `--max-parts` bound the
 part count, `--balance-parts N` then keeps at most N assemblies per distinct
 part count (equal representation per size), and `--sort-by-parts` (implied by
@@ -311,6 +322,7 @@ storage_dir/
 │                             #   (subassembly plan; see above)
 │                             # + timing_breakdown / timing_counts (planner's
 │                             #   per-check buckets; worker CPU-seconds)
+│                             # + sim_cache (hits/misses, when the cache was on)
 │   ├── setup.json            # the planner kwargs
 │   ├── arm_plans.json        # arm pipeline (when --plan-arm or arm_continuous)
 │   ├── timing_overview.json  # per-step + totals timing breakdown (arm pipeline)
@@ -325,6 +337,7 @@ storage_dir/
 ├── obstruction_graph.png     # test_divide_optimizer diagnostic
 ├── subassemblies/            # test_divide_optimizer per-partition screenshots
 └── assembly_time/<run>/      # per-RUN cache for data_assembly_time (tree.pkl + stats.json)
+    assembly_time/sim_cache/  # candidate-check cache shared by those RUNS
 ```
 
 When `--plan-arm` is on (or `arm_continuous=True` in settings), the arm
@@ -343,13 +356,19 @@ Caches:
   — per-planner LLM/VLM response + render caches keyed by content hash.
 - `<storage_dir>/assembly_time/<run_label>/` — per-RUN cache for the
   `data_assembly_time` benchmark (each run gets its own tree.pkl + stats.json).
-- `assets/heuristic_weights_optuna.json` — trained heuristic weights (live
-  file during training, frozen best at study end).
+- `<storage_dir>/assembly_time/sim_cache/`, `assets/optuna_training/sim_cache/`
+  — candidate-check caches (see "Candidate-check cache").
+- `assets/heuristic_weights_optuna.json` — trained heuristic weights (all five),
+  written only at study end.
 - `assets/heuristic_weights_optuna_history.json` — per-trial training log
-  `[{trial, weights, mean_total_s, per_assembly_total_s, elapsed_s}, ...]`,
-  written incrementally so an aborted study leaves usable data.
-- `assets/optuna_training/trial_<NNNN>/<id>/` — per-trial render artifacts
-  used during weight training.
+  `[{trial, outcome, weights, objective, geomean_ratio, n_failed,
+  per_assembly_ratio, per_assembly_total_s, per_assembly_status, ...}, ...]`,
+  rebuilt from the study after every trial. A fresh (non-resumed) study moves
+  the old file aside to `heuristic_weights_optuna_history.<mtime>.json`.
+- `assets/optuna_training/` — `trial_<NNNN>/` (the candidate `weights.json`
+  the planner reads during that trial, plus `<id>/` per-assembly output; wiped
+  at trial start), `baselines/<id>.json` (+ `<id>_run/`), `sim_cache/`, and
+  `study.journal` with `--optuna-resume`.
 
 ## Configuration: `settings.py`
 
@@ -357,7 +376,11 @@ Single source of truth for runtime tuning. Notable keys (all already in
 [settings.py](settings.py)):
 - `LLM_model`, `VLM_model`, `manual_method` — model + manual-backend selection.
 - `render_sequence` — global render-on/off switch (when False, planning still
-  runs but `_render_plan` does no GIF/path output).
+  runs but `_render_plan` does no GIF/path output). `render_gifs` — within
+  `_render_plan`, whether to produce media after the arm pipeline; False keeps
+  only the arm pipeline's timing (what training needs).
+- `sim_cache` — candidate-check cache on/off for the runs that use it
+  (`train_heuristic_weights`, `data_assembly_time`).
 - `n_save_state`, `get_dof`, `skip_stability`, `max_frontier`,
   `no_stable_pose_action` (`exit`/`skip`/`continue`/`ignore_unstable`),
   `interactive_initial_pose`, `debug_stability`, `mark_non_blocking`,
@@ -374,7 +397,8 @@ Single source of truth for runtime tuning. Notable keys (all already in
 - `heuristic_weights_source` (`"default"` or `"optuna"`) +
   `heuristic_weights_optuna_path` — switch between manually-tuned and
   Optuna-trained heuristic weights. Train via `train_heuristic_weights`,
-  flip to `"optuna"` for inference.
+  flip to `"optuna"` for inference. `heuristic_training` configures the
+  search (fixed weights, bounds, queued trials, failure stop, pruner, media).
 - `divide_weights = {balance, contact, fragmentation}` — DivideOptimizer cut score.
 - `divide_split_threshold` — minimum score for accepting a divide split.
 - `arm_continuous`, `arm_simplified_mode`, `arm_simplified_k_dist`,
@@ -393,6 +417,9 @@ Single source of truth for runtime tuning. Notable keys (all already in
 | Multi-generator timing benchmark | `python main.py data_assembly_time --id 00100-00110` |
 | Sequence-finder runtime vs part count | `python main.py data_sequence_runtime --id 00000-20016 --dir data/asap --min-parts 2 --max-parts 20 --balance-parts 3` |
 | Train heuristic weights (Optuna) | `python main.py train_heuristic_weights --id 00100-00120 --optuna-trials 30` |
+| Train with parallel workers (cluster) | N concurrent `python main.py train_heuristic_weights --id <ids> --optuna-dir <dir> --optuna-resume --optuna-trials <total> --optuna-timeout <s>` (baselines are split between them) |
+| Test trained weights on held-out assemblies | `python main.py data_heuristic_weights_eval --id <test ids> --optuna-dir <dir>` |
+| Overnight train + test on Euler | `bash cluster/heuristic_weights_overnight.sh` (arrays of `cluster/heuristic_weights.sbatch`; split, resources and staging in its header) |
 | Plot training history | `python ASAPx/plan_sequence/optimizer/plot_weight_history.py --history assets/heuristic_weights_optuna_history.json --out assets/optuna_training/history.png` |
 | Interactive assembly triage | `python main.py data_filter_assemblies --id 00000-00500 [--allow-gap]` |
 
@@ -414,10 +441,14 @@ Single source of truth for runtime tuning. Notable keys (all already in
   set before planning (`heuristic_weights_source="optuna"`,
   `render_sequence=False`, `debug_stability=False`, …). Anything that flips a
   setting around a `get_assembly_plans` call depends on this.
-- `_render_plan` first runs `play_logged_plan` for the flat per-step disassembly,
-  then (when `stats['divide_split']` is present) runs
+- `_render_plan` first runs the arm pipeline (with `--plan-arm`), then — unless
+  `settings.render_gifs` is False — `play_logged_plan` for the flat per-step
+  disassembly and (when `stats['divide_split']` is present)
   `play_subassembly_split` to emit the unified-split clip plus each
   subassembly's internal disassembly into `storage_dir/subassembly/`.
+- `args.sim_cache_dir` (set only by `train_heuristic_weights` and
+  `data_assembly_time`) is passed to `seq_plan` as the candidate-check cache
+  root; absent everywhere else, so plans are cold by default.
 
 ## Rendering — [ASAPx/plan_sequence/play_logged_plan.py](ASAPx/plan_sequence/play_logged_plan.py)
 
@@ -477,35 +508,136 @@ Output: `log/arm_plans.json` (motion paths) +
 
 `arm_simplified_mode=True` (settings) skips Stage 2 entirely and replaces
 Stage 1 motion times with a closed-form
-`k_dist · d · (1 + k_vol · V)` — cheap mode for benchmarking that still
-verifies rod-grasp feasibility along each path.
+`k_dist · d · (1 + k_vol · V)` — cheap mode for benchmarking. `d` is the
+physics-replayed extraction path (`arm_simplified_replan_paths`; bbox
+diagonal when off), capped at the straight pull that clears the part
+(`arm_simplified_clip_path`, `_straight_pull_distance`): the replay checks
+separation only every 100 sim steps, so it overshoots — by up to ~0.5 cm for
+a normal part, by hundreds of cm for a very light one that tumbles away. The
+replayed paths are matched to their steps by index (`parallel_execute`
+yields in completion order). The rod-grasp check and its `failed_step_time_multiplier`
+penalty (`arm_simplified_check_grasp`) are off by default, so `total_s` is
+modelled motion time only.
 
 ## Heuristic-weight training — [ASAPx/plan_sequence/optimizer/weight_trainer.py](ASAPx/plan_sequence/optimizer/weight_trainer.py)
 
-Optuna study (TPE sampler — no smoothness assumption, handles the
-discontinuous objective well). Per-trial flow:
-1. Sample weights from `DEFAULT_SEARCH_SPACE` (all ≥ 0, upper bounds ≈ 2×
-   `DEFAULT_WEIGHTS`).
-2. Atomic-write to `assets/heuristic_weights_optuna.json`.
-3. For each assembly in `test_eval.assemblies`: redirect `ass.storage_dir`
-   to a per-trial subdir, force `args.cache="new"`, run `get_assembly_plans`
-   under `settings.heuristic_weights_source = "optuna"` (set by the trainer
-   for the study's duration), read back `log/timing_overview.json`.
-4. Mean `total_s` across assemblies is the objective; failed assemblies
-   contribute `None` so partial batches still produce a meaningful number.
-5. Append `{trial, weights, mean_total_s, per_assembly_total_s, elapsed_s}`
-   to `assets/heuristic_weights_optuna_history.json` after every trial.
-6. On study exit (normal or `KeyboardInterrupt`): write the best trial's
-   weights back to the weights file as the frozen final state, restore
-   `heuristic_weights_source` to its pre-study value.
+Optuna study: TPE (`multivariate=True` — the weights act through their
+ratios; `constant_liar=True` — parallel workers don't sample the same point;
+`n_failed` as a constraint) plus `WilcoxonPruner`. Configured by
+`settings.heuristic_training`.
+
+**Objective**: mean over the training assemblies of
+`log(total_s / baseline total_s)` (0 = as fast as the baseline; every
+assembly counts equally). **Baseline** (stage 0, before any trial): one plan
+per assembly with the reference weights (`DEFAULT_WEIGHTS` overridden by
+`settings.heuristic_weights`), stored in `optuna_training/baselines/<id>.json`
+with a fingerprint of the planning/timing settings and reused while it
+matches. An assembly without a complete baseline plan is left out. Several
+processes can build baselines at once (per-assembly lock files). The
+baseline stage also clears each assembly's SDFs once, like a normal run;
+trials then reuse them (`args.use_previous_sdf`), which is what makes
+concurrent workers on one assembly safe.
+
+**Search space**: the cost only ranks candidates, so it is invariant to
+scaling all weights. `hold_count` is pinned to `time_per_held_part_s` (every
+weight reads as predicted seconds per unit of its feature), or to 1.0 while
+that penalty is off (the default); the others are
+log-uniform in `search_bounds`. `fixed_weights` can pin more (e.g.
+`z_alignment`, which `total_s` does not measure). The study starts with two
+queued trials: the reference weights rescaled to the pin (same ranking as
+the baseline, so it must score exactly 0 — the trainer warns if it does not,
+since then trial differences include pipeline noise) and a prior read off the
+time model (`pose_change ≈ π / assembly_reorientation_velocity_rad_s`, ...).
+
+Per-trial flow:
+1. Wipe `assets/optuna_training/trial_<NNNN>/` (trial numbers restart at 0
+   in a non-resumed study, and a leftover `sequence.json` makes
+   `get_assembly_plans_ASAP` skip planning), write the candidate to
+   `trial_<NNNN>/weights.json` and point
+   `settings.heuristic_weights_optuna_path` at it. The shared weights file is
+   never touched mid-study, so parallel trials and inference runs stay
+   independent.
+2. Evaluate the assemblies in an order shuffled per trial (seeded by the trial
+   number, so pruning decisions are not always made on the same few), each
+   into `trial_<NNNN>/<id>/` with `render_gifs` off and the shared
+   candidate-check cache on. `_assess_run` counts an assembly only with
+   `stats['success']`, a full-length sequence and timing for every step: a
+   failed plan still times its partial sequence, which would otherwise score
+   as a fast run.
+3. Report each log ratio to the pruner (step = the assembly's stable index).
+   A pruned trial returns its partial mean (as the Optuna docs recommend, so
+   TPE learns from it) and is marked `outcome: pruned`. A failed assembly ends
+   the trial (`stop_on_failure`): `+inf`, `n_failed` > 0, `outcome:
+   stopped_on_failure`.
+4. Store the history entry as a trial user attribute and rebuild
+   `assets/heuristic_weights_optuna_history.json` from the study, so parallel
+   workers never drop each other's entries.
+5. On study exit (normal or `KeyboardInterrupt`): write the best trial with
+   `outcome == complete` and `n_failed == 0` to the weights file (left as-is
+   when none qualifies); restore every setting and `args` field the trainer
+   changed.
+
+**Time budget** (`--optuna-timeout`, seconds): no trial starts after it and a
+trial ends before an assembly whose planning (1.5x its baseline wall time)
+would run past it (`outcome: deadline`, then `study.stop()`). The weights
+file is rewritten with the best qualifying trial after every trial, so a
+killed job still leaves its result. `--optuna-dir DIR` puts the whole run
+(baselines, trials, cache, journal, `heuristic_weights.json`, `history.json`)
+under DIR.
+
+**Evaluation** (`data_heuristic_weights_eval --id <test ids> --optuna-dir DIR`):
+`evaluate_heuristic_weights` plans + arm-times each held-out assembly three
+ways, exactly like a trial: the heuristic planner with the reference weights
+(`DIR/baselines/`, shared with training), with `DIR/heuristic_weights.json`
+(`DIR/eval_trained/runs/`), and the gen:heur-out baseline (`gen-adapter` +
+`heur-out`, `DIR/heur-out/`). `DIR/eval_trained/summary.{json,txt}` gives
+per-planner success and the paired comparisons trained vs reference, trained
+vs heur-out and heur-out vs reference. Stored runs are
+claimed per assembly through lock files (stale after 6 h or when their
+same-host process is gone), so several processes split the set, and a
+re-run only computes what is missing.
+
+**Parallel workers**: `--optuna-resume` keeps the study in
+`optuna_training/study.journal` (journal storage is safe on a shared
+filesystem). `--optuna-trials` is the study-wide total, so N workers started
+with the same value stop together, and `--optuna-trials 0` only builds the
+baselines. Workers mix their pid into the sampler seed so they don't replay
+the same start-up samples.
 
 **Training vs inference switch**: training is via `train_heuristic_weights`
 (temporarily flips the setting). Inference is via setting
 `heuristic_weights_source = "optuna"` permanently in `settings.py` —
 nothing writes the file outside training, so the weights are frozen.
-Compare default vs trained head-to-head by running `data_assembly_time`,
-which always includes both `heuristic` (default weights) and
-`heuristic_trained` (Optuna weights) as separate RUNS.
+Compare default vs trained head-to-head by running `data_assembly_time` with
+both `heuristic` (default weights) and `heuristic_trained` (Optuna weights)
+in `RUNS`.
+
+## Candidate-check cache — [ASAPx/plan_sequence/planner/sim_cache.py](ASAPx/plan_sequence/planner/sim_cache.py)
+
+A DFA candidate check (`_simulate_standalone`: path, DoF probe, stability) is
+~97% of planning wall time and does not depend on the heuristic weights or on
+which planner asked for it. `DFASequencePlanner.plan` looks each check up
+before submitting it to the worker pool and stores fresh results; replayed
+checks still count toward `n_eval`, so the budget stops a cached plan exactly
+where a cold one stops, and the resulting tree is identical.
+- Enabled by `args.sim_cache_dir` (see "Pipeline glue") with
+  `settings.sim_cache` on. Left off with a planner timeout, `n_success_term`
+  set, tools or `render=True`, and never used on the serial `num_proc=1` path
+  (the base-class planner).
+- Keyed per task by (part, remaining parts, pose); the directory is
+  `<root>/<geometry hash>/<config hash>/`, the config hash covering the
+  planner-level inputs, the physics module constants, the physics source and
+  `filter_below_ground`. Other physics-code edits are not detected: delete the
+  cache after them.
+- One append-only shard per process (`shard_<host>_<pid>.pkl`), so concurrent
+  writers on a shared filesystem never share a file.
+
+Determinism it relies on: the DFA loop processes worker results in submission
+order (tagged `(parent_idx, task_idx)`), so a plan no longer depends on
+`num_proc` or scheduling. The physics still stops some probes on wall-clock
+limits (`physics_planner.MAX_TIME`, `DOF_MAX_TIME` = 5 s per DoF direction),
+so a heavily loaded machine can see a different `dof` (and hence `free_dof`);
+with the cache, the first computation's result is replayed everywhere after.
 
 ## Conventions
 

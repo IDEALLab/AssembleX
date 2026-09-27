@@ -458,15 +458,48 @@ def run_test_convex_decomp(args, test_eval, output_folder, assembly_dir):
 def run_train_heuristic_weights(args, test_eval, output_folder, assembly_dir):
     # ------------------------------------------------------------------
     # Optuna-based black-box optimisation of the HeuristicDFASequencePlanner
-    # weights, using the arm pipeline's total_s as the objective. Each
-    # trial writes its candidate weights to assets/heuristic_weights_optuna.json
-    # (read by the planner because the trainer flips
-    # settings.heuristic_weights_source to "optuna" for the duration).
-    # At study end, the best trial's weights are written back to the same
-    # file as the final, frozen state — flip settings.heuristic_weights_source
-    # to "optuna" in settings.py for inference, leave at "default" to
-    # compare against the manually-tuned `settings.heuristic_weights`.
+    # weights. Objective: mean log(total_s / baseline total_s) over the
+    # assemblies, the baseline being one plan per assembly with the reference
+    # weights (computed first, stored under assets/optuna_training/baselines/).
+    # Each trial writes its candidate weights to its own
+    # assets/optuna_training/trial_<NNNN>/weights.json (read by the planner
+    # because the trainer flips settings.heuristic_weights_source to "optuna"
+    # and points heuristic_weights_optuna_path at it). At study end, the best
+    # fully evaluated trial that planned every assembly is written to
+    # assets/heuristic_weights_optuna.json as the final, frozen state — flip
+    # settings.heuristic_weights_source to "optuna" in settings.py for
+    # inference, leave at "default" to compare against the reference weights.
+    # Search configuration: settings.heuristic_training.
+    #
+    # --optuna-trials is the study-wide trial count (0 = baselines only);
+    # --optuna-resume keeps the study in a journal file, so a later call or
+    # several concurrent workers (e.g. cluster array jobs) extend one study.
     # ------------------------------------------------------------------
+    train_heuristic_weights = _import_weight_trainer().train_heuristic_weights
+
+    n_trials = getattr(args, "optuna_trials", 50)
+    persist = getattr(args, "optuna_resume", False)
+    print(
+        f"[train_heuristic_weights] {len(test_eval.assemblies)} candidate "
+        f"assemblies, target {n_trials} trials  (persist_study={persist})"
+    )
+    study = train_heuristic_weights(
+        test_eval=test_eval,
+        args=args,
+        n_trials=n_trials,
+        persist_study=persist,
+        time_budget_s=getattr(args, "optuna_timeout", None),
+        **_optuna_paths(args),
+    )
+    if study is not None:
+        print(
+            f"[train_heuristic_weights] study finished: {len(study.trials)} trials total"
+        )
+
+
+def _import_weight_trainer():
+    """plan_sequence.optimizer.weight_trainer, imported against ASAPx's own
+    top-level packages (see the eviction note in core/sequence_planner.py)."""
     project_base_dir = os.path.dirname(os.path.abspath(__file__))
     asap_dir = os.path.join(project_base_dir, "ASAPx")
     if asap_dir not in sys.path:
@@ -483,21 +516,53 @@ def run_train_heuristic_weights(args, test_eval, output_folder, assembly_dir):
     for _mod in list(sys.modules.keys()):
         if _mod in _asapx_pkgs or any(_mod.startswith(p + ".") for p in _asapx_pkgs):
             del sys.modules[_mod]
-    from plan_sequence.optimizer.weight_trainer import train_heuristic_weights
+    from plan_sequence.optimizer import weight_trainer
 
-    n_trials = getattr(args, "optuna_trials", 50)
-    persist = getattr(args, "optuna_resume", False)
-    print(
-        f"[train_heuristic_weights] training on {len(test_eval.assemblies)} "
-        f"assemblies for {n_trials} trials  (persist_study={persist})"
+    return weight_trainer
+
+
+def _optuna_paths(args):
+    """Trainer paths for --optuna-dir: everything, weights and history
+    included, under that one directory. Without it the trainer's defaults
+    apply (assets/optuna_training + the weights/history files in assets/)."""
+    run_dir = getattr(args, "optuna_dir", None)
+    if not run_dir:
+        return {}
+    run_dir = Path(run_dir)
+    return {
+        "output_root": run_dir,
+        "weights_path": run_dir / "heuristic_weights.json",
+        "history_path": run_dir / "history.json",
+    }
+
+
+def run_data_heuristic_weights_eval(args, test_eval, output_folder, assembly_dir):
+    # ------------------------------------------------------------------
+    # Test trained heuristic weights on held-out assemblies: plan + arm-time
+    # each with the reference weights and with the trained ones, exactly as
+    # a training trial does (no media, shared candidate-check cache), and
+    # summarise the paired time ratios. The weights are read from
+    # <--optuna-dir>/heuristic_weights.json, or from
+    # settings.heuristic_weights_optuna_path without --optuna-dir. Several
+    # processes given the same ids and --optuna-dir split the assemblies
+    # between them (per-assembly locks); re-running computes only what is
+    # missing. Output: <run dir>/eval_trained/summary.{json,txt}.
+    # ------------------------------------------------------------------
+    weight_trainer = _import_weight_trainer()
+    paths = _optuna_paths(args)
+    weights_path = paths.get("weights_path") or Path(
+        getattr(settings, "heuristic_weights_optuna_path", "assets/heuristic_weights_optuna.json")
     )
-    study = train_heuristic_weights(
-        test_eval=test_eval,
-        args=args,
-        n_trials=n_trials,
-        persist_study=persist,
+    if not Path(weights_path).exists():
+        print(f"[eval] no trained weights at {weights_path}; nothing to evaluate")
+        return
+    weight_trainer.evaluate_heuristic_weights(
+        test_eval,
+        args,
+        weights_path,
+        output_root=paths.get("output_root"),
+        time_budget_s=getattr(args, "optuna_timeout", None),
     )
-    print(f"[train_heuristic_weights] study finished: {len(study.trials)} trials total")
 
 
 def run_data_heuristic_validation(args, test_eval, output_folder, assembly_dir):
@@ -918,6 +983,7 @@ def run_data_assembly_time(args, test_eval, output_folder, assembly_dir):
     _orig_plan_arm = getattr(args, "plan_arm", False)
     _orig_storage = getattr(args, "storage_dir", None)
     _orig_cache = test_eval.cache
+    _orig_sim_cache_dir = getattr(args, "sim_cache_dir", None)
 
     def _write_assembly_time_summary():
         """Aggregate `results` into JSON + TXT + matplotlib charts.
@@ -1255,6 +1321,17 @@ def run_data_assembly_time(args, test_eval, output_folder, assembly_dir):
             results[ass.id] = {}
             base_storage = Path(ass.storage_dir)
             _orig_ass_storage = ass.storage_dir
+            # Every RUN of this assembly, and the subassembly re-plans of the
+            # "+optimizer" RUNS, share one candidate-check cache: the physics
+            # checks do not depend on the planner or weights that ask for them,
+            # so each RUN only simulates the candidates no earlier RUN reached.
+            # The plans come out as they would cold; only planning time (not
+            # measured here) changes. It lives next to the per-RUN tree caches.
+            args.sim_cache_dir = (
+                str(base_storage / "assembly_time" / "sim_cache")
+                if getattr(settings, "sim_cache", False)
+                else None
+            )
             # Set to True if any RUN reports "no self-stable initial
             # pose" for this assembly. Subsequent RUNS without a
             # usable cached sequence are skipped — the precheck is a
@@ -1779,6 +1856,7 @@ def run_data_assembly_time(args, test_eval, output_folder, assembly_dir):
         if _orig_storage is not None:
             args.storage_dir = _orig_storage
         test_eval.cache = _orig_cache
+        args.sim_cache_dir = _orig_sim_cache_dir
         try:
             _write_assembly_time_summary()
         except Exception as _e:
@@ -2524,10 +2602,14 @@ def run_data_sequence_runtime(args, test_eval, output_folder, assembly_dir):
     _orig_render = settings.render_sequence
     _orig_debug_stability = getattr(settings, "debug_stability", False)
     _orig_hw_source = getattr(settings, "heuristic_weights_source", "default")
+    _orig_sim_cache_dir = getattr(args, "sim_cache_dir", None)
 
     try:
         args.planner = "heuristic"
         args.generator = "rand"
+        # Compute time is what this measures: a candidate-check cache would
+        # replay physics instead of running it, so every plan stays cold.
+        args.sim_cache_dir = None
         # No subassembly splitting: the divide optimizer stays off, so the
         # measured time is pure sequence search.
         args.seq_optimizer = None
@@ -2649,6 +2731,7 @@ def run_data_sequence_runtime(args, test_eval, output_folder, assembly_dir):
         settings.render_sequence = _orig_render
         settings.debug_stability = _orig_debug_stability
         settings.heuristic_weights_source = _orig_hw_source
+        args.sim_cache_dir = _orig_sim_cache_dir
         try:
             _write_summary()
         except Exception as _e:

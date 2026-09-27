@@ -979,6 +979,10 @@ class SequencePlanner:
                 skip_stability=settings.skip_stability,
                 max_frontier=settings.max_frontier,
                 seq_optimizer=getattr(args, "seq_optimizer", None),
+                # Candidate-check cache root. Set on args only by the runs that
+                # replan the same assembly many times (train_heuristic_weights,
+                # data_assembly_time); absent everywhere else, so plans are cold.
+                sim_cache_dir=getattr(args, "sim_cache_dir", None),
             )
         finally:
             _ACTIVE_EVAL = None
@@ -1261,6 +1265,12 @@ class SequencePlanner:
                 import traceback as _tb
 
                 print(_tb.format_exc())
+
+        # Timing-only callers (train_heuristic_weights) need the arm pipeline's
+        # timing_overview.json but none of the media below; the fetch steps
+        # after this tolerate missing GIFs and paths/.
+        if not getattr(settings, "render_gifs", True):
+            return
 
         # When the arm pipeline is in simplified mode, the per-step
         # arm_path_full is None — but `show_arm=True` would still trigger

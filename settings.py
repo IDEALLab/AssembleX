@@ -67,6 +67,23 @@ resolve_collisions = False
 # GIFs + path matrices). Set False to skip the post-plan render step entirely.
 render_sequence = True
 
+# Within that step, whether to produce the media: per-step GIFs, path matrices
+# (paths/) and subassembly renders. False still runs the arm pipeline (--plan-arm),
+# which is all a timing-only run needs; train_heuristic_weights turns it off for
+# its trials (heuristic_training["render_gifs"]).
+render_gifs = True
+
+# Persistent cache of the planner's per-candidate physics checks
+# (ASAPx/plan_sequence/planner/sim_cache.py). A check does not depend on the
+# heuristic weights or on which planner asked for it, so runs that replan the
+# same assembly many times reuse it: train_heuristic_weights (every trial and
+# worker, under <output_root>/sim_cache) and data_assembly_time (every RUN of an
+# assembly, under <storage_dir>/assembly_time/sim_cache). Replayed checks give
+# the plan a cold run would, but none of its compute time, so
+# data_sequence_runtime never uses it. Delete a cache after changing physics
+# code other than the constants it already tracks.
+sim_cache = True
+
 # Number of frames to save per disassembly path step (passed as n_frame to
 # save_path_all_objects).
 n_save_state = 5
@@ -182,10 +199,9 @@ arm_continuous = True
 #         V = volume of the part being removed,
 #       and k_dist / k_vol are tuned via arm_simplified_k_dist /
 #       arm_simplified_k_vol.
-#   - Rod-grasp feasibility is still verified along the disassembly path
-#     (cheap — no IK, no RRT). Infeasible steps still get a duration; their
-#     cost is multiplied by `failed_step_time_multiplier` instead of being
-#     imputed from the rest of the sequence's median.
+#   - Optionally (arm_simplified_check_grasp, off by default), rod-grasp
+#     feasibility is verified along the disassembly path and infeasible steps
+#     are penalised by `failed_step_time_multiplier`.
 # Renderer falls back to part-only GIFs (no arm overlay) for these runs.
 # Use this mode to benchmark generator/planner choices without paying the
 # arm-planner's wall-clock cost or noise.
@@ -204,12 +220,28 @@ arm_simplified_k_dist = 1.0
 # so distance still dominates the cost.
 arm_simplified_k_vol = 0.01
 
-# When True, simplified mode still runs the rod-grasp feasibility check
+# When True, simplified mode also runs the rod-grasp feasibility check
 # (cheap — no IK, no RRT) and multiplies the closed-form cost by
 # `failed_step_time_multiplier` for steps where no rod contact survives the
-# disassembly path. Set False to skip the check entirely: every step is
-# treated as feasible and gets the bare k_dist · d · (1 + k_vol · V) cost.
-arm_simplified_check_grasp = True
+# disassembly path. That multiplier is a penalty, not motion time, so it is off
+# by default: every step gets the bare k_dist · d · (1 + k_vol · V) cost.
+arm_simplified_check_grasp = False
+
+# When True, simplified mode replays each step's disassembly in physics to
+# measure d, the distance the part actually travels until it is clear. False
+# (with the grasp check off) skips the replay and uses the part's bounding-box
+# diagonal instead: instant, but the same for every sequence.
+arm_simplified_replan_paths = True
+
+# When True, d is capped at the straight pull that clears the part: its extent
+# along the step's pull direction past the rest's, plus the 0.5 cm physics
+# separation margin. The replay pushes with a fixed force and checks separation
+# only every 100 sim steps, so it overshoots: by up to one ~0.5 cm check for a
+# normal part, and by hundreds of cm for a very light one that tumbles away (a
+# 0.008 cm^3 pin logged d = 274 cm on a 10 cm assembly, a third of all
+# extraction distance in a 36-assembly sample). False reproduces the raw replay
+# length (assets/results/timing_final was produced that way).
+arm_simplified_clip_path = True
 
 # Contact model used by the grasp/arm planner.
 #   'rod'     — replaces the two-finger gripper with a simple cylindrical rod.
@@ -276,8 +308,11 @@ assembly_reorientation_velocity_rad_s = 0.15
 # (beyond the moving gripper itself), summed across all steps in the sequence.
 # Per-step hold_s = len(parts_fix) * time_per_held_part_s, written into
 # timing_overview.json as a separate component and added to totals.total_s.
-# Use 0 to disable the penalty.
-time_per_held_part_s = 2.0
+# 0 (the default) disables it: the constant is an assumption, not measured
+# motion time, and it charges a part held over k steps k times. The held-part
+# count per step is still recorded (hold_count), and at most max_grippers - 1
+# parts can be held either way. assets/results/timing_final used 2.0.
+time_per_held_part_s = 0.0
 
 # Multiplier applied to the median successful-step time when a step (or a
 # stage-2 transition) failed to plan. Models "this step was too hard, costs
@@ -444,10 +479,41 @@ subassembly_shade_ladder = (0.0, 0.40, -0.40, 0.65, -0.65)
 # Inference: keep this at "optuna" and run normal commands — weights are
 # frozen (the planner only reads the file).
 # Training: launched via `python main.py train_heuristic_weights --id <range>`;
-# the training loop writes the file iteratively, then writes the best trial's
-# weights at the end of the study.
+# each trial plans with its own weights file under assets/optuna_training/,
+# and only the best trial's weights are written to this path, at the end of
+# the study.
 heuristic_weights_source = "default"
 heuristic_weights_optuna_path = "assets/heuristic_weights_optuna.json"
+
+# How train_heuristic_weights searches (ASAPx/plan_sequence/optimizer/weight_trainer.py).
+# The objective is the mean over the training assemblies of
+# log(total_s / baseline total_s), the baseline being one plan per assembly with
+# the reference weights (DEFAULT_WEIGHTS, overridden by `heuristic_weights`).
+heuristic_training = {
+    # The cost only ranks candidates, so scaling every weight by one factor
+    # changes nothing and one weight must be pinned. hold_count is pinned to
+    # time_per_held_part_s (None = that setting), so every weight reads as
+    # predicted seconds per unit of its feature -- or to 1.0 while that penalty
+    # is off (0), and the other weights are then relative to it. Pin more weights
+    # to keep them out of training: the objective (total_s) does not measure
+    # z_alignment or free_dof, so training sets those only through their side
+    # effects -- add e.g. "z_alignment": 1.0 if upward pulls matter for the manual.
+    "fixed_weights": {"hold_count": None},
+    # Log-uniform bounds of every weight that is not fixed, in the pinned units.
+    "search_bounds": (0.01, 100.0),
+    # Queue the reference weights (rescaled to the pin; they reproduce the
+    # baseline exactly, so that trial doubles as a determinism check) and a prior
+    # derived from the time model as the first trials.
+    "enqueue_reference": True,
+    "enqueue_time_model_prior": True,
+    # End a trial at its first failed assembly; it can no longer be chosen.
+    "stop_on_failure": True,
+    # WilcoxonPruner p-value threshold (stop a trial once it is significantly
+    # worse than the best on the assemblies seen so far); None disables pruning.
+    "pruner_p_threshold": 0.1,
+    # render_gifs during trials: scoring needs only the arm pipeline's timing.
+    "render_gifs": False,
+}
 
 
 # ============================================================================

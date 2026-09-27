@@ -19,6 +19,7 @@ from run_data import (
     run_data_assembly_time,
     run_data_filter_assemblies,
     run_data_heuristic_validation,
+    run_data_heuristic_weights_eval,
     run_data_manual_validation,
     run_data_sequence_runtime,
     run_data_validate_cost,
@@ -57,6 +58,7 @@ DISPATCH = {
     "data_assembly_time": run_data_assembly_time,
     "data_sequence_runtime": run_data_sequence_runtime,
     "train_heuristic_weights": run_train_heuristic_weights,
+    "data_heuristic_weights_eval": run_data_heuristic_weights_eval,
     "data_heuristic_validation": run_data_heuristic_validation,
     "data_manual_validation": run_data_manual_validation,
     "data_validate_cost": run_data_validate_cost,
@@ -203,12 +205,31 @@ if __name__ == "__main__":
         "--optuna-trials",
         type=int,
         default=50,
-        help="train_heuristic_weights: number of Optuna trials to run.",
+        help="train_heuristic_weights: study-wide number of trials (a resumed study "
+        "or several workers stop once the study has this many); 0 computes the "
+        "baselines only.",
     )
     parser.add_argument(
         "--optuna-resume",
         action="store_true",
-        help="train_heuristic_weights: open a persistent SQLite-backed study so subsequent calls extend it.",
+        help="train_heuristic_weights: keep the study in a journal file under the "
+        "output root, so later calls and concurrent workers extend the same study.",
+    )
+    parser.add_argument(
+        "--optuna-dir",
+        type=str,
+        default=None,
+        help="train_heuristic_weights / data_heuristic_weights_eval: run directory "
+        "holding baselines, trials, cache, the study, and (instead of assets/) the "
+        "trained weights and history. Default: assets/optuna_training.",
+    )
+    parser.add_argument(
+        "--optuna-timeout",
+        type=float,
+        default=None,
+        help="train_heuristic_weights / data_heuristic_weights_eval: wall-clock "
+        "budget in seconds for this process; no trial or run starts past it (set "
+        "below a cluster job's time limit).",
     )
     parser.add_argument(
         "--ai-samples",

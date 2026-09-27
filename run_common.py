@@ -25,7 +25,9 @@ def resolve_ids(
 ):
     """Return a list of assembly IDs to process.
 
-    Accepts either a single ID ("00042") or an inclusive range ("00010-00050").
+    Accepts a single ID ("00042"), an inclusive range ("00010-00050"), or an
+    explicit comma-separated list ("00042,00107,01234", e.g. a fixed train or
+    test split), returned in the given order minus `exclude_ids`.
     For ranges, only IDs that exist as subdirectories of dir_arg are returned.
     Optional `min_parts` / `max_parts` filters drop IDs whose `.obj` count
     falls outside [min_parts, max_parts]. `balance_parts=N` then keeps at most
@@ -35,6 +37,9 @@ def resolve_ids(
     orders the result by ascending part count instead of by ID, with the ID as
     tie-breaker. Filters, balancing and ordering only apply in the range case.
     """
+    if "," in id_arg:
+        excluded = set(exclude_ids or ())
+        return [d.strip() for d in id_arg.split(",") if d.strip() and d.strip() not in excluded]
     if "-" not in id_arg:
         return [id_arg]
 
