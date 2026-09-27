@@ -4,29 +4,42 @@
 #SBATCH --error=/cluster/scratch/%u/logs/%x_%j.err
 #SBATCH --time=02:00:00
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=16G
+#SBATCH --mem-per-cpu=1G
 # No --gpus: the sequence planner is pure CPU (RedMax physics + trimesh).
 #
-# --mem is a flat per-job total, deliberately not --mem-per-cpu. The planner's
-# parallelism is fork-based, so most of the footprint (redmax_py, VTK, torch,
-# coacd, the loaded meshes) is copy-on-write shared between workers rather than
-# duplicated per core: the total behaves like base + k*workers, not 4G*workers.
-# Under --mem-per-cpu=4G, raising --cpus-per-task to 48 would silently request
-# 192G and push the job onto a bigmem node for no reason. Flat --mem lets the
-# core count and the memory request move independently.
+# Memory must be requested per CPU, never per job: Euler's submit filter
+# rejects a flat --mem outright --
 #
-# 16G is extrapolated, not measured. The 7-part 04489 smoke test peaked at
-# 1.13G across 8 workers (sacct MaxRSS; MaxVMSize reads 0 there because Euler
-# gathers accounting from the cgroup, which is precisely what makes that figure
-# whole-job rather than largest-single-process). 15 parts over 16 workers holds
-# more mesh and a deeper tree, so the margin here is wide on purpose. Get the
-# real number from
+#   sbatch: error: lua: Requesting memory by node is not supported.
+#                  Use --mem-per-cpu.
+#
+# so the 1G above means 16G for the job at 16 cores. Slurm enforces that
+# aggregate, which is the figure the cgroup limit is built from.
+#
+# 1G, where the other two scripts carry 4G, because per-CPU is the wrong shape
+# for this workload and a small value is the only way to blunt it. The planner
+# forks its workers, so most of the footprint (redmax_py, VTK, torch, coacd,
+# the loaded meshes) is copy-on-write shared between them rather than
+# duplicated per core: the total behaves like base + k*workers, not
+# 4G*workers. At 4G, raising --cpus-per-task to 48 would request 192G and land
+# the job on a bigmem node for no reason; at 1G the same change asks for 48G,
+# which any standard node can serve.
+#
+# Sizing: the 7-part 04489 smoke test peaked at 1.13G of cgroup RSS across 8
+# workers (sacct MaxRSS; MaxVMSize reads 0 there because Euler gathers
+# accounting from the cgroup, which is precisely what makes that figure
+# whole-job rather than largest-single-process). 15 parts over 16 workers has
+# not been measured, so 16G total is ~14x that, leaving room for the bigger
+# mesh and deeper tree. Get the real number from
 #
 #   sacct -j <jobid> --format=JobID,ReqMem,MaxRSS,MaxVMSize,Elapsed,State
 #
-# and tighten afterwards -- but not to the peak itself: accounting only samples
-# every JobAcctGatherFrequency seconds (scontrol show config), so a short spike
-# during worker spawn can fall between two samples.
+# Two cautions before tightening it. Per-CPU couples in a floor: below about
+# four cores the job total drops under 4G, close enough to the base footprint
+# to matter, so raise --mem-per-cpu if you ever run this narrow. And do not cut
+# to the measured peak -- accounting samples only every
+# JobAcctGatherFrequency seconds (scontrol show config), so a spike at worker
+# spawn can fall between two samples.
 #
 # The Slurm log paths above cannot read shell variables: %u is the submitting
 # user, %x the job name, %j the job id. $SCRATCH/logs has to exist before
@@ -59,7 +72,8 @@
 # on that and stays inside Euler's <=4h scheduling class, where shorter jobs get
 # backfilled into gaps sooner; override with `sbatch --time=...` for a slower
 # assembly. Scale --cpus-per-task and --time together if you change the
-# assembly -- --mem no longer has to move with them.
+# assembly; --mem-per-cpu then scales the total along with the core count on
+# its own.
 
 set -euo pipefail
 
