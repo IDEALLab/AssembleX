@@ -1,11 +1,17 @@
 #!/bin/bash
 #SBATCH --job-name=assemblex_default_test
-#SBATCH --output=/cluster/scratch/fvonarx/logs/assemblex_default_test_%j.out
-#SBATCH --error=/cluster/scratch/fvonarx/logs/assemblex_default_test_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/%x_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/%x_%j.err
 #SBATCH --time=01:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=4G
 # No --gpus: the sequence planner is pure CPU (RedMax physics + trimesh).
+#
+# The Slurm log paths above cannot read shell variables: %u is the submitting
+# user, %x the job name, %j the job id. $SCRATCH/logs has to exist before
+# submitting, or Slurm has nowhere to write and the job dies without a word:
+#
+#   mkdir -p "$SCRATCH/logs"
 #
 # Fast install test on the assembly that ships with the repository.
 #
@@ -36,7 +42,10 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuration (override by exporting these before sbatch)
 # ---------------------------------------------------------------------------
-SCRATCH_DIR="${SCRATCH_DIR:-/cluster/scratch/fvonarx}"
+# $SCRATCH is Euler's own shortcut for /cluster/scratch/$USER; the literal path
+# is the fallback for a shell that does not define it. Export SCRATCH_DIR to
+# install somewhere else entirely.
+SCRATCH_DIR="${SCRATCH_DIR:-${SCRATCH:-/cluster/scratch/${USER}}}"
 REPO_DIR="${REPO_DIR:-${SCRATCH_DIR}/AssembleX}"
 CONTAINER_PATH="${CONTAINER_PATH:-${SCRATCH_DIR}/assemble-x-container_latest.sif}"
 USER_BASE="${SCRATCH_DIR}/.local"
@@ -80,6 +89,15 @@ export APPTAINERENV_OMP_NUM_THREADS="1"
 export APPTAINERENV_OPENBLAS_NUM_THREADS="1"
 export APPTAINERENV_MKL_NUM_THREADS="1"
 
+section() { echo; echo "=== $* ==="; }
+die()     { echo "ERROR: $*" >&2; exit 1; }
+
+# Checked before the mkdir below, so a wrong SCRATCH_DIR is one clear error
+# rather than a pile of mkdir failures.
+[ -d "${SCRATCH_DIR}" ] || die "scratch directory does not exist: ${SCRATCH_DIR}
+       On Euler this is the \$SCRATCH shortcut for /cluster/scratch/\$USER.
+       Export SCRATCH_DIR to install somewhere else."
+
 mkdir -p "${SCRATCH_DIR}/logs" "${SCRATCH_DIR}/.cache/matplotlib" \
          "${APPTAINER_CACHEDIR}" "${APPTAINER_TMPDIR}"
 
@@ -93,9 +111,6 @@ in_container() {
     apptainer exec --cleanenv "${BIND_ARGS[@]}" --pwd "${REPO_DIR}" \
         "${CONTAINER_PATH}" "$@"
 }
-
-section() { echo; echo "=== $* ==="; }
-die()     { echo "ERROR: $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Step 1: preflight

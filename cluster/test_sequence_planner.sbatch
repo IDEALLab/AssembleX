@@ -1,11 +1,38 @@
 #!/bin/bash
 #SBATCH --job-name=assemblex_seqplan_test
-#SBATCH --output=/cluster/scratch/fvonarx/logs/assemblex_seqplan_test_%j.out
-#SBATCH --error=/cluster/scratch/fvonarx/logs/assemblex_seqplan_test_%j.err
-#SBATCH --time=04:00:00
+#SBATCH --output=/cluster/scratch/%u/logs/%x_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/%x_%j.err
+#SBATCH --time=02:00:00
 #SBATCH --cpus-per-task=16
-#SBATCH --mem-per-cpu=4G
+#SBATCH --mem=16G
 # No --gpus: the sequence planner is pure CPU (RedMax physics + trimesh).
+#
+# --mem is a flat per-job total, deliberately not --mem-per-cpu. The planner's
+# parallelism is fork-based, so most of the footprint (redmax_py, VTK, torch,
+# coacd, the loaded meshes) is copy-on-write shared between workers rather than
+# duplicated per core: the total behaves like base + k*workers, not 4G*workers.
+# Under --mem-per-cpu=4G, raising --cpus-per-task to 48 would silently request
+# 192G and push the job onto a bigmem node for no reason. Flat --mem lets the
+# core count and the memory request move independently.
+#
+# 16G is extrapolated, not measured. The 7-part 04489 smoke test peaked at
+# 1.13G across 8 workers (sacct MaxRSS; MaxVMSize reads 0 there because Euler
+# gathers accounting from the cgroup, which is precisely what makes that figure
+# whole-job rather than largest-single-process). 15 parts over 16 workers holds
+# more mesh and a deeper tree, so the margin here is wide on purpose. Get the
+# real number from
+#
+#   sacct -j <jobid> --format=JobID,ReqMem,MaxRSS,MaxVMSize,Elapsed,State
+#
+# and tighten afterwards -- but not to the peak itself: accounting only samples
+# every JobAcctGatherFrequency seconds (scontrol show config), so a short spike
+# during worker spawn can fall between two samples.
+#
+# The Slurm log paths above cannot read shell variables: %u is the submitting
+# user, %x the job name, %j the job id. $SCRATCH/logs has to exist before
+# submitting, or Slurm has nowhere to write and the job dies without a word:
+#
+#   mkdir -p "$SCRATCH/logs"
 #
 # Install test: plans one assembly end to end with the sequence planner only.
 #
@@ -28,15 +55,21 @@
 #
 # Reference: assembly 01234 has 15 parts and plans in 14 steps. On the dev
 # machine it took ~570 s wall with 80 workers, which is ~24,000 CPU-seconds,
-# so expect roughly 30-45 min on 16 cores. Scale --cpus-per-task and --time
-# together if you change the assembly.
+# so expect roughly 30-45 min on 16 cores. --time=02:00:00 leaves ~2.5x margin
+# on that and stays inside Euler's <=4h scheduling class, where shorter jobs get
+# backfilled into gaps sooner; override with `sbatch --time=...` for a slower
+# assembly. Scale --cpus-per-task and --time together if you change the
+# assembly -- --mem no longer has to move with them.
 
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Configuration (override by exporting these before sbatch)
 # ---------------------------------------------------------------------------
-SCRATCH_DIR="${SCRATCH_DIR:-/cluster/scratch/fvonarx}"
+# $SCRATCH is Euler's own shortcut for /cluster/scratch/$USER; the literal path
+# is the fallback for a shell that does not define it. Export SCRATCH_DIR to
+# install somewhere else entirely.
+SCRATCH_DIR="${SCRATCH_DIR:-${SCRATCH:-/cluster/scratch/${USER}}}"
 REPO_DIR="${REPO_DIR:-${SCRATCH_DIR}/AssembleX}"
 CONTAINER_PATH="${CONTAINER_PATH:-${SCRATCH_DIR}/assemble-x-container_latest.sif}"
 USER_BASE="${SCRATCH_DIR}/.local"
@@ -68,6 +101,15 @@ export APPTAINERENV_OMP_NUM_THREADS="1"
 export APPTAINERENV_OPENBLAS_NUM_THREADS="1"
 export APPTAINERENV_MKL_NUM_THREADS="1"
 
+section() { echo; echo "=== $* ==="; }
+die()     { echo "ERROR: $*" >&2; exit 1; }
+
+# Checked before the mkdir below, so a wrong SCRATCH_DIR is one clear error
+# rather than a pile of mkdir failures.
+[ -d "${SCRATCH_DIR}" ] || die "scratch directory does not exist: ${SCRATCH_DIR}
+       On Euler this is the \$SCRATCH shortcut for /cluster/scratch/\$USER.
+       Export SCRATCH_DIR to install somewhere else."
+
 mkdir -p "${SCRATCH_DIR}/logs" "${APPTAINER_CACHEDIR}" "${APPTAINER_TMPDIR}"
 
 BIND_ARGS=(--bind "${SCRATCH_DIR}:${SCRATCH_DIR}")
@@ -80,9 +122,6 @@ in_container() {
     apptainer exec --cleanenv "${BIND_ARGS[@]}" --pwd "${REPO_DIR}" \
         "${CONTAINER_PATH}" "$@"
 }
-
-section() { echo; echo "=== $* ==="; }
-die()     { echo "ERROR: $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Step 1: preflight

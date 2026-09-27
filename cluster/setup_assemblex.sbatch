@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=assemblex_setup
-#SBATCH --output=/cluster/scratch/fvonarx/logs/assemblex_setup_%j.out
-#SBATCH --error=/cluster/scratch/fvonarx/logs/assemblex_setup_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/%x_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/%x_%j.err
 #SBATCH --time=03:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=4G
@@ -12,7 +12,7 @@
 # One-time initialisation of AssembleX on the cluster. Idempotent: re-running
 # it re-checks every step and only redoes what is missing.
 #
-#   mkdir -p /cluster/scratch/fvonarx/logs
+#   mkdir -p "$SCRATCH/logs"
 #   sbatch cluster/setup_assemblex.sbatch
 #
 # What it does, in order:
@@ -35,7 +35,10 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuration (override by exporting these before sbatch)
 # ---------------------------------------------------------------------------
-SCRATCH_DIR="${SCRATCH_DIR:-/cluster/scratch/fvonarx}"
+# $SCRATCH is Euler's own shortcut for /cluster/scratch/$USER; the literal path
+# is the fallback for a shell that does not define it. Export SCRATCH_DIR to
+# install somewhere else entirely.
+SCRATCH_DIR="${SCRATCH_DIR:-${SCRATCH:-/cluster/scratch/${USER}}}"
 REPO_DIR="${REPO_DIR:-${SCRATCH_DIR}/AssembleX}"
 CONTAINER_PATH="${CONTAINER_PATH:-${SCRATCH_DIR}/assemble-x-container_latest.sif}"
 REPO_URL="${REPO_URL:-https://github.com/IDEALLab/AssembleX.git}"
@@ -57,6 +60,16 @@ export APPTAINERENV_https_proxy="${https_proxy:-}"
 export APPTAINERENV_PREPEND_PATH="${USER_BASE}/bin"
 export APPTAINER_CACHEDIR="${SCRATCH_DIR}/.apptainer/cache"
 export APPTAINER_TMPDIR="${SCRATCH_DIR}/.apptainer/tmp"
+
+section() { echo; echo "=== $* ==="; }
+warn()    { echo "WARNING: $*" >&2; }
+die()     { echo "ERROR: $*" >&2; exit 1; }
+
+# Checked before the mkdir below, so a wrong SCRATCH_DIR is one clear error
+# rather than a pile of mkdir failures.
+[ -d "${SCRATCH_DIR}" ] || die "scratch directory does not exist: ${SCRATCH_DIR}
+       On Euler this is the \$SCRATCH shortcut for /cluster/scratch/\$USER.
+       Export SCRATCH_DIR to install somewhere else."
 
 mkdir -p "${SCRATCH_DIR}/logs" "${USER_BASE}" "${WORK_DIR}" \
          "${APPTAINER_CACHEDIR}" "${APPTAINER_TMPDIR}"
@@ -81,10 +94,6 @@ in_container_bare() {
     apptainer exec --cleanenv "${BIND_ARGS[@]}" --pwd "${SCRATCH_DIR}" \
         "${CONTAINER_PATH}" "$@"
 }
-
-section() { echo; echo "=== $* ==="; }
-warn()    { echo "WARNING: $*" >&2; }
-die()     { echo "ERROR: $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Step 0: preflight
