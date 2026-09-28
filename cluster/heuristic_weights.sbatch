@@ -7,33 +7,38 @@
 #SBATCH --mem-per-cpu=1G
 # No --gpus: planning and the simplified arm pipeline are pure CPU.
 #
-# One worker of a heuristic-weight run: PHASE=train trains the
-# HeuristicDFASequencePlanner weights (main.py train_heuristic_weights),
-# PHASE=eval tests the result on held-out assemblies against the reference
-# weights and the gen:heur-out baseline (main.py data_heuristic_weights_eval). Submit it through
-# cluster/heuristic_weights_overnight.sh, which sets the variables below and
-# chains the eval array after the train array; submitting it by hand works the
-# same way:
+# One worker of a heuristic-weight run, in one of four phases:
+#   baselines  training split, reference weights, uncached (main.py
+#              train_heuristic_weights --optuna-trials 0);
+#   train      the Optuna trials (main.py train_heuristic_weights);
+#   eval_ref   test split, reference weights and gen:heur-out, uncached and
+#              independent of training (main.py data_heuristic_weights_eval
+#              --eval-reference-only);
+#   eval       test split, trained weights (EVAL_SPLIT=1: also trained weights +
+#              subassembly plan), then the summary (main.py
+#              data_heuristic_weights_eval [--eval-split]).
+# Submit through cluster/heuristic_weights_submit.sh, which sets the variables
+# below, sizes each phase and chains them; by hand it works the same way:
 #
 #   PHASE=train RUN_NAME=my_run IDS=04600,03094 sbatch --array=0-2 cluster/heuristic_weights.sbatch
 #
 # Several array tasks of one phase cooperate on one run directory
 # (assets/optuna_runs/$RUN_NAME): training workers share an Optuna journal
 # study (constant-liar TPE, so they sample different points) and the
-# candidate-check cache; every per-assembly run (training baselines, eval runs)
-# is claimed through a lock file, so the workers split the assemblies between
+# candidate-check cache; every per-assembly run (baselines, eval runs) is
+# claimed through a lock file, so the workers split the assemblies between
 # them. --optuna-trials is the study-wide total, so all workers stop together.
 #
-# Resources, per the sizing notes in test_sequence_planner.sbatch:
+# Resources (measured on the 2026-09-27 test run; the defaults below are only
+# for a bare sbatch, the submit script sets each phase):
 #   - memory per CPU, never per job (Euler's submit filter rejects --mem);
-#   - 1G per CPU, because the planner forks its workers and shares most of the
-#     footprint copy-on-write (base + k*workers, not 4G*workers). 32G per task
-#     here; 16-part assemblies on 32 workers have not been measured yet, so read
-#     the real peak afterwards and keep a margin above it:
-#       sacct -j <jobid> --format=JobID,ReqMem,MaxRSS,Elapsed,State
-#   - 32 cores per task: the planner's useful parallelism on 8-16 parts is
-#     ~16-38 workers (the width of one frontier batch), so more cores per task
-#     buy little; more array tasks buy more trials in parallel instead.
+#     1G per CPU, because the planner forks its workers and shares most of the
+#     footprint copy-on-write (base + k*workers): 32-core tasks peaked at
+#     4.1-6.1G on 8-16-part assemblies. Below ~4 cores raise --mem-per-cpu.
+#   - cores by phase: uncached planning (baselines, eval_ref) keeps 16-32
+#     workers busy (one frontier batch is ~16-38 checks wide); trials replay
+#     93-100% of their physics from the cache after ~12 trials and used only
+#     17-19% of 32 cores, so training runs on narrow tasks, more of them.
 #
 # Time: the Python side gets a budget = the job's remaining time minus
 # MARGIN_S (read from squeue at start). No trial or run starts past it, and a
@@ -49,10 +54,10 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuration (set by the submit script; override by exporting)
 # ---------------------------------------------------------------------------
-PHASE="${PHASE:?set PHASE=train or PHASE=eval}"
+PHASE="${PHASE:?set PHASE to baselines, train, eval_ref or eval}"
 RUN_NAME="${RUN_NAME:?set RUN_NAME (the run directory name under assets/optuna_runs)}"
-# Comma-separated assembly ids: the training split for PHASE=train, the test
-# split for PHASE=eval.
+# Comma-separated assembly ids: the training split for baselines / train, the
+# test split for eval_ref / eval.
 IDS="${IDS:?set IDS to a comma-separated list of assembly ids}"
 ASSEMBLY_SUBDIR="${ASSEMBLY_SUBDIR:-data/asap}"
 N_TRIALS="${N_TRIALS:-60}"
@@ -61,6 +66,9 @@ N_TRIALS="${N_TRIALS:-60}"
 BUDGET="${BUDGET:-6000}"
 # Seconds kept free at the end of the job for the final writes.
 MARGIN_S="${MARGIN_S:-1800}"
+# PHASE=eval: 1 also plans the test split with the trained weights plus the
+# recursive subassembly plan and compares it (--eval-split).
+EVAL_SPLIT="${EVAL_SPLIT:-0}"
 
 SCRATCH_DIR="${SCRATCH_DIR:-${SCRATCH:-/cluster/scratch/${USER}}}"
 REPO_DIR="${REPO_DIR:-${SCRATCH_DIR}/AssembleX}"
@@ -191,18 +199,28 @@ COMMON_ARGS=(
     --token-limit 0
 )
 case "${PHASE}" in
+    baselines)
+        section "Step 2: training baselines (reference weights, uncached)"
+        CMD=(main.py train_heuristic_weights "${COMMON_ARGS[@]}"
+             --optuna-resume --optuna-trials 0)
+        ;;
     train)
         section "Step 2: training (study-wide target ${N_TRIALS} trials)"
         CMD=(main.py train_heuristic_weights "${COMMON_ARGS[@]}"
              --optuna-resume --optuna-trials "${N_TRIALS}")
+        ;;
+    eval_ref)
+        section "Step 2: test-split baselines (reference weights and gen:heur-out)"
+        CMD=(main.py data_heuristic_weights_eval "${COMMON_ARGS[@]}" --eval-reference-only)
         ;;
     eval)
         section "Step 2: evaluation on the held-out split"
         [ -f "${REPO_DIR}/${RUN_DIR}/heuristic_weights.json" ] \
             || die "no trained weights at ${RUN_DIR}/heuristic_weights.json (did training finish a trial?)"
         CMD=(main.py data_heuristic_weights_eval "${COMMON_ARGS[@]}")
+        [ "${EVAL_SPLIT}" = "1" ] && CMD+=(--eval-split)
         ;;
-    *) die "PHASE must be train or eval, not ${PHASE}" ;;
+    *) die "PHASE must be baselines, train, eval_ref or eval, not ${PHASE}" ;;
 esac
 
 START_TS=$(date +%s)
@@ -218,7 +236,11 @@ echo "main.py exited with ${RUN_RC} after ${ELAPSED}s"
 # Step 3: report
 # ---------------------------------------------------------------------------
 section "Step 3: report"
+count_runs() { find "${REPO_DIR}/${RUN_DIR}/$1" -maxdepth 1 -name '*.json' ! -name weights.json 2>/dev/null | wc -l; }
 case "${PHASE}" in
+    baselines|eval_ref)
+        echo "stored runs so far: $(count_runs baselines) reference, $(count_runs heur-out) heur-out"
+        ;;
     train)
         if [ -f "${REPO_DIR}/${RUN_DIR}/heuristic_weights.json" ]; then
             echo "best weights so far: $(cat "${REPO_DIR}/${RUN_DIR}/heuristic_weights.json" | tr -d '\n ')"
