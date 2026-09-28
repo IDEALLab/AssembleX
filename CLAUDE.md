@@ -606,6 +606,21 @@ Per-trial flow:
    failed plan still times its partial sequence, which would otherwise score
    as a fast run.
 3. Report each log ratio to the pruner (step = the assembly's stable index).
+**Several objectives** (`heuristic_training['objectives']`, default in
+settings `("time", "held_parts", "non_upward")`; `("time",)` is the plain
+study): the time model charges neither held parts nor the pull direction, and
+a penalty in seconds would only fix their exchange rate in advance. Each is an
+objective of its own instead — per-step means of `len(parts_fix)` and of
+`1 - z` of the unit action along the chosen sequence's tree edges
+(`_plan_metrics`, defined like the `hold_count` / `z_alignment` features),
+averaged over the assemblies. The study finds the Pareto front, written to
+`<weights>_pareto.json` (`DIR/heuristic_weights_pareto.json`), and
+`pareto_pick` chooses the weights from it: `no_worse_than_reference` (the
+fastest front trial at most as bad as the reference weights on the others;
+the queued reference trial always qualifies) or `fastest`. Optuna does not
+prune multi-objective studies, so every trial is a full pass. The eval
+summary reports both metrics per paired comparison.
+
    A pruned trial returns its partial mean (as the Optuna docs recommend, so
    TPE learns from it) and is marked `outcome: pruned`. A failed assembly ends
    the trial (`stop_on_failure`): `+inf`, `n_failed` > 0, `outcome:

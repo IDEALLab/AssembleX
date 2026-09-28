@@ -514,6 +514,18 @@ heuristic_training = {
     # render_gifs during trials: scoring needs only the arm pipeline's timing.
     "render_gifs": False,
 }
+    # What trials are scored on, all minimised: "time" (the mean log time
+    # ratio), plus optionally "held_parts" (extra parts held per step) and
+    # "non_upward" (1 - cos of the pull's angle to world up, per step). The
+    # time model charges neither, so rather than a penalty with a guessed
+    # exchange rate they are objectives of their own and the study finds the
+    # Pareto front (written to <weights>_pareto.json). Several objectives turn
+    # pruning off, so every trial is a full pass. ("time",) is the plain study.
+    "objectives": ("time", "held_parts", "non_upward"),
+    # Which Pareto trial becomes the weights: "no_worse_than_reference" = the
+    # fastest one at most as bad as the reference weights on the others;
+    # "fastest" ignores them.
+    "pareto_pick": "no_worse_than_reference",
 
 
 # ============================================================================
