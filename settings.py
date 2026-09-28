@@ -513,7 +513,6 @@ heuristic_training = {
     "pruner_p_threshold": 0.1,
     # render_gifs during trials: scoring needs only the arm pipeline's timing.
     "render_gifs": False,
-}
     # What trials are scored on, all minimised: "time" (the mean log time
     # ratio), plus optionally "held_parts" (extra parts held per step) and
     # "non_upward" (1 - cos of the pull's angle to world up, per step). The
@@ -526,6 +525,7 @@ heuristic_training = {
     # fastest one at most as bad as the reference weights on the others;
     # "fastest" ignores them.
     "pareto_pick": "no_worse_than_reference",
+}
 
 
 # ============================================================================

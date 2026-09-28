@@ -598,6 +598,37 @@ the queued reference trial always qualifies) or `fastest`. Optuna does not
 prune multi-objective studies, so every trial is a full pass. The eval
 summary reports both metrics per paired comparison.
 
+**Search space**: the cost only ranks candidates, so it is invariant to
+scaling all weights. `hold_count` is pinned to `time_per_held_part_s` (every
+weight reads as predicted seconds per unit of its feature), or to 1.0 while
+that penalty is off (the default); the others are
+log-uniform in `search_bounds`. `fixed_weights` can pin more (e.g.
+`z_alignment`, which `total_s` does not measure). The study starts with two
+queued trials: the reference weights rescaled to the pin (same ranking as
+the baseline, so it must score exactly 0 — the trainer warns if it does not,
+since then trial differences include pipeline noise, or the stored runs no
+longer hold for the current code; it is the one trial that plans afresh
+instead of reading the store) and a prior read off the time model
+(`pose_change ≈ π / assembly_reorientation_velocity_rad_s`, ...).
+`--optuna-warm-start DIR[,DIR]` queues more: the best `warm_start_top` trials
+by time of each earlier run's history, plus its Pareto front; on the
+assemblies they were evaluated on they come from the store at no cost.
+
+Per-trial flow:
+1. Each (assembly, candidate weights) run goes through the result store: a
+   run already made under the same fingerprint is read back, anything else
+   is planned into the store with the candidate written to its own
+   `.weights.json` and `settings.heuristic_weights_optuna_path` pointed at
+   it. The shared weights file is never touched mid-study, so parallel
+   trials and inference runs stay independent.
+2. Evaluate the assemblies in an order shuffled per trial (seeded by the trial
+   number, so pruning decisions are not always made on the same few), with
+   `render_gifs` off and the shared candidate-check cache on. `_assess_run`
+   counts an assembly only with `stats['success']`, a full-length sequence
+   and timing for every step: a
+   failed plan still times its partial sequence, which would otherwise score
+   as a fast run.
+3. Report each log ratio to the pruner (step = the assembly's stable index).
    A pruned trial returns its partial mean (as the Optuna docs recommend, so
    TPE learns from it) and is marked `outcome: pruned`. A failed assembly ends
    the trial (`stop_on_failure`): `+inf`, `n_failed` > 0, `outcome:
@@ -640,37 +671,6 @@ planner with the reference weights (the same runs as training baselines),
 with `DIR/heuristic_weights.json`, and the gen:heur-out baseline
 (`gen-adapter` + `heur-out`). `DIR/eval_trained/summary.{json,txt}` gives
 per-planner success and the paired comparisons trained vs reference, trained
-**Search space**: the cost only ranks candidates, so it is invariant to
-scaling all weights. `hold_count` is pinned to `time_per_held_part_s` (every
-weight reads as predicted seconds per unit of its feature), or to 1.0 while
-that penalty is off (the default); the others are
-log-uniform in `search_bounds`. `fixed_weights` can pin more (e.g.
-`z_alignment`, which `total_s` does not measure). The study starts with two
-queued trials: the reference weights rescaled to the pin (same ranking as
-the baseline, so it must score exactly 0 — the trainer warns if it does not,
-since then trial differences include pipeline noise, or the stored runs no
-longer hold for the current code; it is the one trial that plans afresh
-instead of reading the store) and a prior read off the time model
-(`pose_change ≈ π / assembly_reorientation_velocity_rad_s`, ...).
-`--optuna-warm-start DIR[,DIR]` queues more: the best `warm_start_top` trials
-by time of each earlier run's history, plus its Pareto front; on the
-assemblies they were evaluated on they come from the store at no cost.
-
-Per-trial flow:
-1. Each (assembly, candidate weights) run goes through the result store: a
-   run already made under the same fingerprint is read back, anything else
-   is planned into the store with the candidate written to its own
-   `.weights.json` and `settings.heuristic_weights_optuna_path` pointed at
-   it. The shared weights file is never touched mid-study, so parallel
-   trials and inference runs stay independent.
-2. Evaluate the assemblies in an order shuffled per trial (seeded by the trial
-   number, so pruning decisions are not always made on the same few), with
-   `render_gifs` off and the shared candidate-check cache on. `_assess_run`
-   counts an assembly only with `stats['success']`, a full-length sequence
-   and timing for every step: a
-   failed plan still times its partial sequence, which would otherwise score
-   as a fast run.
-3. Report each log ratio to the pruner (step = the assembly's stable index).
 vs heur-out and heur-out vs reference. `--eval-split` adds a fourth,
 `trained+split` (trained weights + `--seq-optimizer divide`, scored by the
 subassembly timing) and two more totals of that
