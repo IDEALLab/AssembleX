@@ -43,9 +43,11 @@ by purpose:
   - `data_assembly_time` — multi-generator timing benchmark. For each ID, plans
     + renders + arm-pipelines under every entry in `RUNS` and emits per-assembly
     stacked-bar PNGs + a cross-assembly mean chart. Includes `heuristic_trained`
-    (reads the Optuna weights) and `heuristic+optimizer` (reuses the heuristic
-    tree, applies the divide split, re-plans each subassembly standalone in
-    parallel). All RUNS of an assembly share one candidate-check cache (see
+    (reads the Optuna weights) and `<base>+optimizer` RUNS, which plan like
+    `<base>` with `--seq-optimizer divide` and are scored by the recursive
+    subassembly plan's own timing (`timing_overview_split.json`, see
+    "Subassembly timing"), or by the flat sequence when no plan was found or it
+    cannot be carried out as told. All RUNS of an assembly share one candidate-check cache (see
     "Candidate-check cache"), so each RUN only simulates what no earlier RUN
     reached.
   - `train_heuristic_weights` — Optuna study that tunes
@@ -184,8 +186,8 @@ Composed of three plug-in registries (each is a dict in their package
     original sequence's parts not in `S∪R`, then a unified-split step, then
     independently re-planned S and R sub-sequences in parallel via raw
     `mp.Process` workers using fork context) and returns a fully decomposed
-    cost breakdown. Used by `test_divide_optimizer` and the
-    `heuristic+optimizer` run of `data_assembly_time`.
+    cost breakdown. Used by `test_divide_optimizer` (data_assembly_time's
+    `+optimizer` RUNS moved to the recursive plan and its timing).
   - `weight_trainer.py` — Optuna-backed black-box optimisation of
     `HeuristicDFASequencePlanner` weights against arm-pipeline `total_s`.
     See "Heuristic-weight training" below.
@@ -301,11 +303,48 @@ block path (`Step.subassembly`, e.g. `["S", "R"]`). When a plan is present,
 artifacts it reads (GIFs, path matrices) are looked up by `obj_id`, not by
 position. `_apply_step_details` matches by part id for the same reason.
 
-Caveat: each step's feasibility was verified with the *other* side still
-present, which is strictly more constrained than the split narrative, so
-collisions are covered. Sub-assembly **stability** in isolation is not
-re-checked — `verify_separation` establishes separability, not that each half
-stands on its own.
+Caveat: when the plan is built, each step's feasibility was verified with the
+*other* side still present, and `verify_separation` establishes separability,
+not that each half stands on its own. The subassembly timing below re-checks
+every step in the context it happens in, stability included, so a plan that
+cannot be carried out as told is caught there.
+
+## Subassembly timing — [ASAPx/plan_robot/split_timing.py](ASAPx/plan_robot/split_timing.py)
+
+The flat timing covers `stats['sequence']`, a tree path on which every part
+comes off the whole remaining assembly; with `split_sequence_source ==
+'derived'` (the common case) that is not the split order at all, and even a
+`'tree'` path is timed with R still attached while S is taken apart and without
+the join. `SequencePlanner._render_plan` therefore also runs
+`time_split_plan` whenever `stats['split_plan']` exists (arm pipeline on,
+simplified mode), writing `log/timing_overview_split.json`:
+- The plan is walked in execution order: prefix parts off the whole body, the
+  join (R lifted off S as one body), then S's block, then R's, recursively.
+  The last part of every block is not a step.
+- Each removal is resolved with the planner's own candidate check
+  (`_simulate_standalone`) on the body present at that moment, over the body's
+  candidate poses (`dfa.candidate_poses`, the same generator the DFA search
+  uses), taking the planner's pick: feasible first, then closest to the current
+  orientation. The checks go through the candidate-check cache. A removal with
+  no feasible pose makes the file `status: infeasible` (with the failing part);
+  consumers then fall back to the flat timing.
+- A join is priced as the straight pull of unified R along the verified
+  separation direction until it clears unified S by `MIN_SEP`, with R's volume
+  in the `k_vol` term, and keeps the body's orientation.
+- Reorientation of the first step of an R block is measured from R's
+  orientation at the join (`reorient_from_pose`), not from the last S step.
+- Timed by `arm_pipeline.time_steps_simplified`, the same model as the flat
+  timing; `per_step` entries carry `kind: remove|join`. `totals` is the
+  sequential time (one worker). `parallel` (`parallel_makespan`) is the time
+  with S and R of every split taken apart at once by separate workers: a split
+  block takes prefix + join + max(S, R), recursively (up to 4 workers at depth
+  2); same step times, except that the first step of an R block travels from
+  the join. Both come from the same steps, so either can be dropped later.
+
+Consumers: `data_heuristic_weights_eval --eval-split` (the `trained+split`
+run set: trained weights + divide; its stored records say whether the split
+was `used`, `none`, `infeasible` or `untimed`, plus the flat total) and
+`data_assembly_time`'s `+optimizer` RUNS.
 
 ## Storage / outputs
 
@@ -326,6 +365,7 @@ storage_dir/
 │   ├── setup.json            # the planner kwargs
 │   ├── arm_plans.json        # arm pipeline (when --plan-arm or arm_continuous)
 │   ├── timing_overview.json  # per-step + totals timing breakdown (arm pipeline)
+│   ├── timing_overview_split.json  # the subassembly plan timed as carried out
 │   └── failures.json         # _dump_failure_evidence payload (on partial plans)
 ├── paths/                    # per-step recorded motion (npy frames)
 ├── 0_<obj>.gif, …            # primary-view per-step disassembly GIFs
@@ -419,7 +459,8 @@ Single source of truth for runtime tuning. Notable keys (all already in
 | Train heuristic weights (Optuna) | `python main.py train_heuristic_weights --id 00100-00120 --optuna-trials 30` |
 | Train with parallel workers (cluster) | N concurrent `python main.py train_heuristic_weights --id <ids> --optuna-dir <dir> --optuna-resume --optuna-trials <total> --optuna-timeout <s>` (baselines are split between them) |
 | Test trained weights on held-out assemblies | `python main.py data_heuristic_weights_eval --id <test ids> --optuna-dir <dir>` |
-| Overnight train + test on Euler | `bash cluster/heuristic_weights_overnight.sh` (arrays of `cluster/heuristic_weights.sbatch`; split, resources and staging in its header) |
+| Train + test on Euler | `bash cluster/heuristic_weights_submit.sh` (four arrays of `cluster/heuristic_weights.sbatch`: baselines, train, eval_ref, eval; split, sizing and resources in its header) |
+| Same, with the subassembly plan in the test | `bash cluster/heuristic_weights_split_test.sh` (`EVAL_SPLIT=1`: adds the `trained+split` planner) |
 | Plot training history | `python ASAPx/plan_sequence/optimizer/plot_weight_history.py --history assets/heuristic_weights_optuna_history.json --out assets/optuna_training/history.png` |
 | Interactive assembly triage | `python main.py data_filter_assemblies --id 00000-00500 [--allow-gap]` |
 
@@ -592,7 +633,15 @@ ways, exactly like a trial: the heuristic planner with the reference weights
 (`DIR/eval_trained/runs/`), and the gen:heur-out baseline (`gen-adapter` +
 `heur-out`, `DIR/heur-out/`). `DIR/eval_trained/summary.{json,txt}` gives
 per-planner success and the paired comparisons trained vs reference, trained
-vs heur-out and heur-out vs reference. Stored runs are
+vs heur-out and heur-out vs reference. `--eval-split` adds a fourth,
+`trained+split` (trained weights + `--seq-optimizer divide`, scored by the
+subassembly timing; `DIR/eval_trained/split_runs/`) and two more totals of that
+run: `trained+split-par` (its parallel time) and `trained+divide` (its flat
+sequence, i.e. the divide optimizer's sequence choice without the split). All
+are compared with the other three, and the summary reports on how many
+assemblies the plan was used. `--eval-reference-only` plans just the
+two baselines (reference, heur-out), which do not depend on training; the
+cluster submit script runs that phase alongside training. Stored runs are
 claimed per assembly through lock files (stale after 6 h or when their
 same-host process is gone), so several processes split the set, and a
 re-run only computes what is missing.
@@ -619,7 +668,13 @@ A DFA candidate check (`_simulate_standalone`: path, DoF probe, stability) is
 which planner asked for it. `DFASequencePlanner.plan` looks each check up
 before submitting it to the worker pool and stores fresh results; replayed
 checks still count toward `n_eval`, so the budget stops a cached plan exactly
-where a cold one stops, and the resulting tree is identical.
+where a cold one stops, and the resulting tree is identical. Two more records
+go through the same cache: the initial stable-pose precheck (one per assembly,
+`_initial_stable_poses_cached`) and the final 2-part leaf expansion, which the
+DFA planner runs through the worker pool (`DFASequencePlanner._expand_leaf`,
+same candidates and first-feasible choice as the serial base version). With
+the search replayed, those two were ~90 s of a ~116 s cached plan on the
+2026-09-27 run.
 - Enabled by `args.sim_cache_dir` (see "Pipeline glue") with
   `settings.sim_cache` on. Left off with a planner timeout, `n_success_term`
   set, tools or `render=True`, and never used on the serial `num_proc=1` path

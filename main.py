@@ -224,6 +224,20 @@ if __name__ == "__main__":
         "trained weights and history. Default: assets/optuna_training.",
     )
     parser.add_argument(
+        "--eval-reference-only",
+        action="store_true",
+        help="data_heuristic_weights_eval: plan the test set with the reference "
+        "weights and gen:heur-out only (they do not depend on training), so a "
+        "cluster run can do it while training is still going.",
+    )
+    parser.add_argument(
+        "--eval-split",
+        action="store_true",
+        help="data_heuristic_weights_eval: also plan the test set with the trained "
+        "weights plus the recursive subassembly plan (--seq-optimizer divide), timed "
+        "as the plan is carried out, and compare it with the other planners.",
+    )
+    parser.add_argument(
         "--optuna-timeout",
         type=float,
         default=None,

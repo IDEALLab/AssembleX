@@ -546,14 +546,17 @@ def run_data_heuristic_weights_eval(args, test_eval, output_folder, assembly_dir
     # settings.heuristic_weights_optuna_path without --optuna-dir. Several
     # processes given the same ids and --optuna-dir split the assemblies
     # between them (per-assembly locks); re-running computes only what is
-    # missing. Output: <run dir>/eval_trained/summary.{json,txt}.
+    # missing. Output: <run dir>/eval_trained/summary.{json,txt}. With
+    # --eval-reference-only it plans just the two baselines (reference weights,
+    # gen:heur-out), which a cluster run does while training is still going.
     # ------------------------------------------------------------------
     weight_trainer = _import_weight_trainer()
     paths = _optuna_paths(args)
     weights_path = paths.get("weights_path") or Path(
         getattr(settings, "heuristic_weights_optuna_path", "assets/heuristic_weights_optuna.json")
     )
-    if not Path(weights_path).exists():
+    reference_only = getattr(args, "eval_reference_only", False)
+    if not reference_only and not Path(weights_path).exists():
         print(f"[eval] no trained weights at {weights_path}; nothing to evaluate")
         return
     weight_trainer.evaluate_heuristic_weights(
@@ -562,6 +565,8 @@ def run_data_heuristic_weights_eval(args, test_eval, output_folder, assembly_dir
         weights_path,
         output_root=paths.get("output_root"),
         time_budget_s=getattr(args, "optuna_timeout", None),
+        reference_only=reference_only,
+        split=getattr(args, "eval_split", False),
     )
 
 
@@ -984,6 +989,7 @@ def run_data_assembly_time(args, test_eval, output_folder, assembly_dir):
     _orig_storage = getattr(args, "storage_dir", None)
     _orig_cache = test_eval.cache
     _orig_sim_cache_dir = getattr(args, "sim_cache_dir", None)
+    _orig_seq_optimizer = getattr(args, "seq_optimizer", None)
 
     def _write_assembly_time_summary():
         """Aggregate `results` into JSON + TXT + matplotlib charts.
@@ -1018,6 +1024,15 @@ def run_data_assembly_time(args, test_eval, output_folder, assembly_dir):
                     },
                     "n_steps_planned": len(entry.get("per_step", []) or []),
                 }
+                # "+optimizer" RUNS scored by a subassembly plan: also its time
+                # with S and R taken apart in parallel, and the flat total.
+                if entry.get("parallel"):
+                    summary["per_assembly"][aid][label]["parallel_total_s"] = float(
+                        entry["parallel"]["total_s"]
+                    )
+                    summary["per_assembly"][aid][label]["flat_total_s"] = float(
+                        (entry.get("flat_totals") or {}).get("total_s", 0.0)
+                    )
 
         json_path = at_dir / "assembly_time_summary.json"
         with open(json_path, "w") as _f:
@@ -1399,260 +1414,16 @@ def run_data_assembly_time(args, test_eval, output_folder, assembly_dir):
                         )
                         continue
 
-                # ------------------------------------------------------
-                # Special-case: "heuristic+optimizer" reuses the heuristic
-                # run's tree + timing (no re-planning), then runs the
-                # divide optimizer to find a split; if one is found, the
-                # two subassemblies are re-planned + re-rendered + re-
-                # armed standalone, and the run's total time is built as
-                #   prefix (heuristic per-step entries for parts not in
-                #          S∪R) + separation step + S total + R total
-                # mirroring the cost decomposition in compare.py. If no
-                # split is verified, falls back to the heuristic timing.
-                # ------------------------------------------------------
-                if run_label.endswith("+optimizer"):
-                    # Reuse the tree + timing of the run this one is derived
-                    # from ("<base>+optimizer" builds on "<base>"), so the
-                    # divide optimizer is compared against its own baseline
-                    # rather than always against the default-weight run.
-                    _base_label = run_label[: -len("+optimizer")]
-                    heur_cache_log = (
-                        base_storage / "assembly_time" / _base_label / "log"
-                    )
-                    heur_output_log = at_dir / str(ass.id) / _base_label / "log"
-                    req_paths = [
-                        heur_cache_log / "tree.pkl",
-                        heur_cache_log / "stats.json",
-                        heur_output_log / "timing_overview.json",
-                    ]
-                    if not all(p.exists() for p in req_paths):
-                        missing = [str(p) for p in req_paths if not p.exists()]
-                        results[ass.id][run_label] = {
-                            "status": "error",
-                            "error": f"{_base_label} run artifacts missing: {missing}",
-                        }
-                        print(
-                            f"[assembly-time]    {run_label}: {_base_label} artifacts missing"
-                        )
-                        continue
-                    try:
-                        with open(heur_cache_log / "tree.pkl", "rb") as _f:
-                            heur_tree = pickle.load(_f)
-                        with open(heur_cache_log / "stats.json") as _f:
-                            heur_stats = json.load(_f)
-                        with open(heur_output_log / "timing_overview.json") as _f:
-                            heur_timing = json.load(_f)
-                    except Exception as _e:
-                        results[ass.id][run_label] = {
-                            "status": "error",
-                            "error": f"failed to load heuristic artifacts: {_e}",
-                        }
-                        continue
-                    heur_seq = heur_stats.get("sequence") or []
-
-                    # Run divide optimizer on the heuristic tree.
-                    try:
-                        from plan_sequence.optimizer import DivideOptimizer
-                        from plan_sequence.optimizer.compare import (
-                            _prepare_subassembly_dir,
-                        )
-
-                        opt = DivideOptimizer(
-                            heur_tree,
-                            asset_folder=asset_folder,
-                            assembly_dir=str(ass.assembly_dir),
-                        )
-                        if opt.build_obstruction_graph() is None:
-                            raise RuntimeError(
-                                "no dof_info in heuristic tree (need get_dof=True)"
-                            )
-                        opt.find_locally_free_subassemblies(timeout=100)
-                        opt.verify_locally_free(
-                            top_k=10, num_proc=getattr(args, "num_proc", 8)
-                        )
-                        verified = getattr(opt, "verified_locally_free", None) or []
-                    except Exception as _e:
-                        import traceback as _tb
-
-                        _tb.print_exc()
-                        results[ass.id][run_label] = {
-                            "status": "error",
-                            "error": f"divide optimizer failed: {_e}",
-                        }
-                        continue
-
-                    heur_per_step = heur_timing.get("per_step") or []
-
-                    # Fallback: no verified split → copy heuristic timing.
-                    if not verified:
-                        overview = dict(heur_timing)
-                        overview["status"] = "ok"
-                        overview["note"] = "no_verified_split_fallback"
-                        (output_run_dir / "log").mkdir(parents=True, exist_ok=True)
-                        with open(
-                            output_run_dir / "log" / "timing_overview.json", "w"
-                        ) as _f:
-                            json.dump(overview, _f, indent=2)
-                        results[ass.id][run_label] = overview
-                        tot = overview.get("totals", {})
-                        print(
-                            f"[assembly-time]    {run_label}: no split; "
-                            f"reusing heuristic total={tot.get('total_s', 0.0):.2f}s"
-                        )
-                        continue
-
-                    chosen = verified[0]
-                    parts_S = sorted(chosen[0])
-                    parts_R = sorted(chosen[1])
-                    print(
-                        f"[assembly-time]    {run_label}: split S={parts_S}  R={parts_R}"
-                    )
-
-                    # Re-run the full pipeline (plan + render + arm) for S
-                    # and R standalone. Swap ass.assembly_dir / ass.storage_dir
-                    # temporarily; the planner reads parts from assembly_dir
-                    # directly, so the override is enough. Each subassembly
-                    # is treated like a normal assembly: NO base_part
-                    # override, so the planner runs its standard initial
-                    # self-stable-pose precheck and computes a fresh
-                    # stable pose per step. Stability behaviour follows
-                    # settings.skip_stability — same as a non-split run.
-                    sub_timings = {}
-                    sub_failure = None
-                    _saved_dir = ass.assembly_dir
-                    _saved_storage = ass.storage_dir
-                    _saved_cache = args.cache
-                    try:
-                        for sub_label, sub_parts in (("S", parts_S), ("R", parts_R)):
-                            # Always source from the ORIGINAL assembly dir
-                            # (_saved_dir), not from a possibly-overridden
-                            # ass.assembly_dir left over from the previous
-                            # sub-iteration.
-                            sub_assembly_tmp = _prepare_subassembly_dir(
-                                str(_saved_dir),
-                                sub_parts,
-                            )
-                            sub_output_dir = output_run_dir / f"sub_{sub_label}"
-                            sub_output_dir.mkdir(parents=True, exist_ok=True)
-                            try:
-                                ass.assembly_dir = Path(sub_assembly_tmp)
-                                ass.storage_dir = sub_output_dir
-                                args.cache = "new"  # always re-plan subassembly
-                                print(
-                                    f"[assembly-time]    {run_label}: re-running pipeline "
-                                    f"for sub-{sub_label} ({len(sub_parts)} parts)"
-                                )
-                                ass.planner.get_assembly_plans(args)
-                                sub_timing_path = (
-                                    sub_output_dir / "log" / "timing_overview.json"
-                                )
-                                if not sub_timing_path.exists():
-                                    raise RuntimeError(
-                                        f"sub-{sub_label} produced no timing_overview.json"
-                                    )
-                                with open(sub_timing_path) as _f:
-                                    sub_timings[sub_label] = json.load(_f)
-                            finally:
-                                # Restore ass.assembly_dir / storage_dir
-                                # between sub-iterations so the next call
-                                # to _prepare_subassembly_dir resolves
-                                # against the original assembly even if a
-                                # downstream callee mutates the attribute.
-                                ass.assembly_dir = _saved_dir
-                                ass.storage_dir = _saved_storage
-                                shutil.rmtree(sub_assembly_tmp, ignore_errors=True)
-                    except Exception as _e:
-                        import traceback as _tb
-
-                        _tb.print_exc()
-                        sub_failure = f"{_e}"
-                    finally:
-                        ass.assembly_dir = _saved_dir
-                        ass.storage_dir = _saved_storage
-                        args.cache = _saved_cache
-
-                    if sub_failure or len(sub_timings) != 2:
-                        results[ass.id][run_label] = {
-                            "status": "error",
-                            "error": f"subassembly pipeline failed: {sub_failure}",
-                        }
-                        continue
-
-                    # Aggregate: prefix + separation + S + R.
-                    in_split = set(parts_S) | set(parts_R)
-                    prefix_parts = [p for p in heur_seq if p not in in_split]
-
-                    prefix_components = dict.fromkeys(COMPONENTS, 0.0)
-                    for step in heur_per_step:
-                        if step.get("part") in prefix_parts:
-                            for c in COMPONENTS:
-                                prefix_components[c] += float(step.get(c, 0.0) or 0.0)
-
-                    # Separation-step time estimate: one disassembly-step
-                    # worth of motion, sized at the median per-step total
-                    # of the heuristic run (matches the cost-side z_alignment
-                    # placeholder in compare.py — one rough step's-worth).
-                    sep_components = dict.fromkeys(COMPONENTS, 0.0)
-                    if heur_per_step:
-                        sorted_totals = sorted(
-                            float(s.get("total_s", 0.0) or 0.0) for s in heur_per_step
-                        )
-                        median_total = sorted_totals[len(sorted_totals) // 2]
-                        sep_components["step_disassembly_s"] = median_total
-
-                    s_totals = sub_timings["S"].get("totals") or {}
-                    r_totals = sub_timings["R"].get("totals") or {}
-
-                    agg = dict.fromkeys(COMPONENTS, 0.0)
-                    for c in COMPONENTS:
-                        agg[c] = (
-                            prefix_components[c]
-                            + sep_components[c]
-                            + float(s_totals.get(c, 0.0) or 0.0)
-                            + float(r_totals.get(c, 0.0) or 0.0)
-                        )
-                    agg["total_s"] = sum(agg[c] for c in COMPONENTS)
-
-                    overview = {
-                        "status": "ok",
-                        "totals": agg,
-                        "components": {
-                            "prefix": prefix_components,
-                            "separation": sep_components,
-                            "S_totals": {
-                                c: float(s_totals.get(c, 0.0) or 0.0)
-                                for c in COMPONENTS
-                            },
-                            "R_totals": {
-                                c: float(r_totals.get(c, 0.0) or 0.0)
-                                for c in COMPONENTS
-                            },
-                        },
-                        "split": {
-                            "S": parts_S,
-                            "R": parts_R,
-                            "divide_score": float(chosen[2]),
-                        },
-                        "prefix_sequence": prefix_parts,
-                        "S_sequence": sub_timings["S"].get("sequence"),
-                        "R_sequence": sub_timings["R"].get("sequence"),
-                        "per_step": [],
-                    }
-                    (output_run_dir / "log").mkdir(parents=True, exist_ok=True)
-                    with open(
-                        output_run_dir / "log" / "timing_overview.json", "w"
-                    ) as _f:
-                        json.dump(overview, _f, indent=2)
-                    results[ass.id][run_label] = overview
-                    print(
-                        f"[assembly-time]    {run_label}: total={agg['total_s']:.2f}s "
-                        f"(prefix={sum(prefix_components.values()):.2f} + "
-                        f"sep={sum(sep_components.values()):.2f} + "
-                        f"S={float(s_totals.get('total_s', 0.0)):.2f} + "
-                        f"R={float(r_totals.get('total_s', 0.0)):.2f})"
-                    )
-                    continue
-                # ------------------------------------------------------
+                # "<base>+optimizer" RUNS plan like <base> with --seq-optimizer
+                # divide: the recursive subassembly plan is built on top of the
+                # flat sequence, and the RUN is scored by the plan's own timing
+                # (timing_overview_split.json, written by _render_plan) -- or by
+                # the flat sequence when no plan was found or it cannot be
+                # carried out as told. The search replays <base>'s physics from
+                # the shared candidate-check cache.
+                args.seq_optimizer = (
+                    "divide" if run_label.endswith("+optimizer") else _orig_seq_optimizer
+                )
 
                 # 1) Sequence: load from cache, or plan into cache_dir.
                 tree = None
@@ -1829,6 +1600,25 @@ def run_data_assembly_time(args, test_eval, output_folder, assembly_dir):
                     }
                     continue
                 overview["status"] = "ok"
+                if run_label.endswith("+optimizer"):
+                    split_path = output_run_dir / "log" / "timing_overview_split.json"
+                    split = None
+                    if split_path.exists():
+                        try:
+                            with open(split_path) as _f:
+                                split = json.load(_f)
+                        except Exception:
+                            split = None
+                    if split is not None and split.get("status") == "ok":
+                        split["flat_totals"] = overview.get("totals")
+                        split["note"] = "subassembly_plan"
+                        overview = split
+                    else:
+                        overview["note"] = (
+                            "no_subassembly_plan" if split is None
+                            else f"subassembly_plan_infeasible: {split.get('failure')}"
+                        )
+                    overview["status"] = "ok"
                 results[ass.id][run_label] = overview
                 totals = overview.get("totals", {})
                 print(
@@ -1857,6 +1647,7 @@ def run_data_assembly_time(args, test_eval, output_folder, assembly_dir):
             args.storage_dir = _orig_storage
         test_eval.cache = _orig_cache
         args.sim_cache_dir = _orig_sim_cache_dir
+        args.seq_optimizer = _orig_seq_optimizer
         try:
             _write_assembly_time_summary()
         except Exception as _e:

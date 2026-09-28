@@ -1266,6 +1266,44 @@ class SequencePlanner:
 
                 print(_tb.format_exc())
 
+        # Subassembly plan (--seq-optimizer divide): the flat timing above covers
+        # stats['sequence'], a tree path on which every part comes off the whole
+        # assembly. Time the plan as it is carried out -- prefix, R lifted off S,
+        # S and R taken apart on their own -- into timing_overview_split.json.
+        # Simplified mode only: a join has no per-part arm motion to plan.
+        if (
+            _plan_arm
+            and getattr(settings, "arm_continuous", True)
+            and getattr(settings, "arm_simplified_mode", False)
+            and plan_sequence
+        ):
+            try:
+                with open(_log_dir / "stats.json") as f:
+                    _split_stats = json.load(f)
+                if _split_stats.get("split_plan"):
+                    from ASAPx.plan_robot.split_timing import time_split_plan
+
+                    _setup_path = _log_dir / "setup.json"
+                    _setup = json.load(open(_setup_path)) if _setup_path.exists() else {}
+                    time_split_plan(
+                        asset_folder,
+                        os.path.join(asap_dir, "assets"),
+                        assembly_dir,
+                        _split_stats,
+                        _setup,
+                        log_dir=str(_log_dir),
+                        num_proc=getattr(args, "num_proc", 8) or 8,
+                        sim_cache_dir=getattr(args, "sim_cache_dir", None),
+                        allow_gap=getattr(args, "allow_gap", False),
+                        gripper_type=_gripper_type,
+                        gripper_scale=_gripper_scale,
+                    )
+            except Exception as _split_e:
+                print(f"[sequence_planner] subassembly timing failed: {_split_e}")
+                import traceback as _tb
+
+                print(_tb.format_exc())
+
         # Timing-only callers (train_heuristic_weights) need the arm pipeline's
         # timing_overview.json but none of the media below; the fetch steps
         # after this tolerate missing GIFs and paths/.
