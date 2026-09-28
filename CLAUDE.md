@@ -657,9 +657,14 @@ are compared with the other three, and the summary reports on how many
 assemblies the plan was used. `--eval-reference-only` plans just the
 two baselines (reference, heur-out), which do not depend on training; the
 cluster submit script runs that phase alongside training. Stored runs are
-claimed per assembly through lock files (stale after 6 h or when their
-same-host process is gone), so several processes split the set, and a
-re-run only computes what is missing.
+claimed per assembly through lock files, so several processes split the set,
+and a re-run only computes what is missing. A holder refreshes its lock every
+minute; a lock not refreshed for 15 min, or whose same-host process is gone,
+is taken over (a worker killed mid-plan, e.g. out of memory, once blocked the
+others for hours). Each worker first computes everything no other worker
+holds, across all run sets, and only then waits. The evaluation runs its sets
+in the order reference, trained, trained+split, heur-out, so heur-out runs
+left over from the reference-only phase cannot starve the trained ones.
 
 **Parallel workers**: `--optuna-resume` keeps the study in
 `optuna_training/study.journal` (journal storage is safe on a shared
