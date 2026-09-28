@@ -489,6 +489,7 @@ def run_train_heuristic_weights(args, test_eval, output_folder, assembly_dir):
         n_trials=n_trials,
         persist_study=persist,
         time_budget_s=getattr(args, "optuna_timeout", None),
+        warm_start=[p for p in (getattr(args, "optuna_warm_start", None) or "").split(",") if p],
         **_optuna_paths(args),
     )
     if study is not None:
@@ -522,14 +523,18 @@ def _import_weight_trainer():
 
 
 def _optuna_paths(args):
-    """Trainer paths for --optuna-dir: everything, weights and history
-    included, under that one directory. Without it the trainer's defaults
-    apply (assets/optuna_training + the weights/history files in assets/)."""
+    """Trainer paths for --optuna-dir: the run's own files (study, weights,
+    history, summary) under that one directory; without it the trainer's
+    defaults apply (assets/optuna_training + the weights/history files in
+    assets/). Planned runs and the cache go to the shared store
+    (--optuna-store, default assets/optuna_store) either way."""
+    paths = {"store": getattr(args, "optuna_store", None)}
     run_dir = getattr(args, "optuna_dir", None)
     if not run_dir:
-        return {}
+        return paths
     run_dir = Path(run_dir)
     return {
+        **paths,
         "output_root": run_dir,
         "weights_path": run_dir / "heuristic_weights.json",
         "history_path": run_dir / "history.json",
@@ -564,6 +569,7 @@ def run_data_heuristic_weights_eval(args, test_eval, output_folder, assembly_dir
         args,
         weights_path,
         output_root=paths.get("output_root"),
+        store=paths.get("store"),
         time_budget_s=getattr(args, "optuna_timeout", None),
         reference_only=reference_only,
         split=getattr(args, "eval_split", False),

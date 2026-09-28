@@ -23,11 +23,13 @@
 #   PHASE=train RUN_NAME=my_run IDS=04600,03094 sbatch --array=0-2 cluster/heuristic_weights.sbatch
 #
 # Several array tasks of one phase cooperate on one run directory
-# (assets/optuna_runs/$RUN_NAME): training workers share an Optuna journal
-# study (constant-liar TPE, so they sample different points) and the
-# candidate-check cache; every per-assembly run (baselines, eval runs) is
-# claimed through a lock file, so the workers split the assemblies between
-# them. --optuna-trials is the study-wide total, so all workers stop together.
+# (assets/optuna_runs/$RUN_NAME: the study, weights, history, summary):
+# training workers share an Optuna journal study (constant-liar TPE, so they
+# sample different points). Every planned run (baselines, trial runs, eval
+# runs) and the candidate-check cache live in the store shared by all runs
+# (STORE_DIR, assets/optuna_store), each claimed through a lock file, so the
+# workers split the work and a later run reuses it. --optuna-trials is the
+# study-wide total, so all workers stop together.
 #
 # Resources (measured on the 2026-09-27 test run; the defaults below are only
 # for a bare sbatch, the submit script sets each phase):
@@ -77,6 +79,12 @@ USER_BASE="${SCRATCH_DIR}/.local"
 NUM_PROC="${NUM_PROC:-${SLURM_CPUS_PER_TASK:-4}}"
 # Relative to REPO_DIR, which is the working directory inside the container.
 RUN_DIR="assets/optuna_runs/${RUN_NAME}"
+# Every planned run and the candidate-check cache, shared by all runs: a new
+# run reuses whatever an earlier one planned under identical conditions.
+STORE_DIR="${STORE_DIR:-assets/optuna_store}"
+# Train phase: earlier run directories (comma-separated, relative to the repo)
+# whose best weights start the study.
+WARM_START="${WARM_START:-}"
 
 export APPTAINERENV_PYTHONUSERBASE="${USER_BASE}"
 export APPTAINERENV_http_proxy="${http_proxy:-}"
@@ -184,6 +192,7 @@ fi
 [ "${TIME_BUDGET_S}" -gt 600 ] || die "time budget ${TIME_BUDGET_S}s is too small; raise --time or lower MARGIN_S"
 echo "time budget for Python: ${TIME_BUDGET_S}s  (job left ${SECONDS_LEFT:-?}s, margin ${MARGIN_S}s)"
 echo "run directory: ${REPO_DIR}/${RUN_DIR}"
+echo "store:         ${REPO_DIR}/${STORE_DIR}"
 echo "workers: ${NUM_PROC}   planner budget: ${BUDGET}"
 
 # ---------------------------------------------------------------------------
@@ -193,6 +202,7 @@ COMMON_ARGS=(
     --id "${IDS}"
     --dir "${ASSEMBLY_SUBDIR}"
     --optuna-dir "${RUN_DIR}"
+    --optuna-store "${STORE_DIR}"
     --optuna-timeout "${TIME_BUDGET_S}"
     --num-proc "${NUM_PROC}"
     --budget "${BUDGET}"
@@ -208,6 +218,7 @@ case "${PHASE}" in
         section "Step 2: training (study-wide target ${N_TRIALS} trials)"
         CMD=(main.py train_heuristic_weights "${COMMON_ARGS[@]}"
              --optuna-resume --optuna-trials "${N_TRIALS}")
+        [ -n "${WARM_START}" ] && CMD+=(--optuna-warm-start "${WARM_START}")
         ;;
     eval_ref)
         section "Step 2: test-split baselines (reference weights and gen:heur-out)"
@@ -236,10 +247,10 @@ echo "main.py exited with ${RUN_RC} after ${ELAPSED}s"
 # Step 3: report
 # ---------------------------------------------------------------------------
 section "Step 3: report"
-count_runs() { find "${REPO_DIR}/${RUN_DIR}/$1" -maxdepth 1 -name '*.json' ! -name weights.json 2>/dev/null | wc -l; }
+count_runs() { grep -l "\"label\": \"$1\"" "${REPO_DIR}/${STORE_DIR}"/runs/*/*.json 2>/dev/null | wc -l; }
 case "${PHASE}" in
     baselines|eval_ref)
-        echo "stored runs so far: $(count_runs baselines) reference, $(count_runs heur-out) heur-out"
+        echo "store (all runs): $(count_runs baseline) + $(count_runs reference) reference, $(count_runs heur-out) heur-out"
         ;;
     train)
         if [ -f "${REPO_DIR}/${RUN_DIR}/heuristic_weights.json" ]; then

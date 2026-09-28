@@ -224,6 +224,23 @@ if __name__ == "__main__":
         "trained weights and history. Default: assets/optuna_training.",
     )
     parser.add_argument(
+        "--optuna-store",
+        type=str,
+        default=None,
+        help="train_heuristic_weights / data_heuristic_weights_eval: store of every "
+        "planned run and the candidate-check cache, shared by all runs, so a later run "
+        "(more or other assemblies, a new study) reuses what earlier ones planned under "
+        "identical conditions. Default: assets/optuna_store.",
+    )
+    parser.add_argument(
+        "--optuna-warm-start",
+        type=str,
+        default=None,
+        help="train_heuristic_weights: comma-separated earlier run directories (or "
+        "history files) whose best weights are queued as the first trials; on the "
+        "assemblies they were evaluated on they come from the store for free.",
+    )
+    parser.add_argument(
         "--eval-reference-only",
         action="store_true",
         help="data_heuristic_weights_eval: plan the test set with the reference "

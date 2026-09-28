@@ -63,6 +63,13 @@ N_TRIALS="${N_TRIALS:-60}"
 # the recursive subassembly plan (--seq-optimizer divide), timed as the plan is
 # carried out, and compares it with the other planners.
 EVAL_SPLIT="${EVAL_SPLIT:-0}"
+# Store of every planned run, shared by all runs (relative to the repo): a
+# run plans only what no earlier run planned under identical conditions, so a
+# wider or larger sample adds to the earlier data instead of redoing it.
+STORE_DIR="${STORE_DIR:-assets/optuna_store}"
+# Earlier run directories (comma-separated, e.g. assets/optuna_runs/full_v1)
+# whose best weights start this run's study; free on the assemblies they saw.
+WARM_START="${WARM_START:-}"
 
 # workers x cores x time limit per phase
 BASE_WORKERS="${BASE_WORKERS:-3}";   BASE_CPUS="${BASE_CPUS:-32}";   BASE_TIME="${BASE_TIME:-03:00:00}"
@@ -88,7 +95,7 @@ fi
 if [ -e "${RUN_PATH}/run_info.txt" ] && [ "${RESUME:-0}" != "1" ]; then
     echo "ERROR: ${RUN_PATH} already holds a run. Pick another RUN_NAME, or set" >&2
     echo "       RESUME=1 to extend it (study, stored runs and cache are reused; if an" >&2
-    echo "       earlier job was killed, first: find ${RUN_PATH} -name '*.lock' -delete)." >&2
+    echo "       earlier job was killed, its locks go stale within 15 min)." >&2
     exit 1
 fi
 mkdir -p "${SCRATCH_DIR}/logs" "${RUN_PATH}"
@@ -100,7 +107,7 @@ submit() {
     local phase="$1" ids="$2" workers="$3" cpus="$4" limit="$5"
     shift 5
     env PHASE="${phase}" RUN_NAME="${RUN_NAME}" IDS="${ids}" N_TRIALS="${N_TRIALS}" \
-        EVAL_SPLIT="${EVAL_SPLIT}" \
+        EVAL_SPLIT="${EVAL_SPLIT}" STORE_DIR="${STORE_DIR}" WARM_START="${WARM_START}" \
         sbatch --parsable \
             --job-name="hw_${phase}_${RUN_NAME}" \
             --array="0-$(( workers - 1 ))" \
@@ -127,6 +134,7 @@ eval_job=$(submit eval "${TEST_IDS}" "${EVAL_WORKERS}" "${EVAL_CPUS}" "${EVAL_TI
     echo "eval_ref:   job ${eref_job}, ${EREF_WORKERS} x ${EREF_CPUS} cores, ${EREF_TIME}"
     echo "eval:       job ${eval_job}, ${EVAL_WORKERS} x ${EVAL_CPUS} cores, ${EVAL_TIME}, ids ${TEST_IDS}"
     echo "n_trials:   ${N_TRIALS}   mem per cpu: ${MEM_PER_CPU}   eval_split: ${EVAL_SPLIT}"
+    echo "store:      ${STORE_DIR}   warm start: ${WARM_START:-none}"
 } | tee -a "${RUN_PATH}/run_info.txt"
 
 cat <<EOF
