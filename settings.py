@@ -385,6 +385,12 @@ preference_planner = {
     "log_path": "assets/preference_decisions.jsonl",  # PA-update audit log (append-only)
 }
 
+# Which complete sequence of the explored tree the heuristic planner returns:
+# "min_cost" = the one with the lowest summed edge cost under the planner's own
+# weights (a shortest path over the tree after the search; no extra physics),
+# "first" = the first one the search completed (the behaviour before).
+sequence_selection = "min_cost"
+
 
 # ============================================================================
 # Divide optimizer

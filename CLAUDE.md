@@ -159,10 +159,14 @@ Composed of three plug-in registries (each is a dict in their package
   variants configured via `settings.py`.
 - **Optimizers** ([ASAPx/plan_sequence/optimizer/](ASAPx/plan_sequence/optimizer/))
   — pick a final sequence from a completed tree.
-  - `BaseSequenceOptimizer` — random valid root-to-leaf; also exposes
-    `optimize_scored(cost_fn=..., divide_optimizer=...)` which picks the
-    minimum-cost valid sequence and surfaces the divide-optimizer's split
-    for diagnostic logging.
+  - `select_min_cost_sequence(tree, edge_cost, prefer=...)` (optimizer/base.py)
+    — the cheapest complete sequence of an explored tree under a per-edge
+    cost, as a shortest path over edges (so `pose_change` sees the path's own
+    previous pose; the tree shares nodes between sequences), never
+    enumerating sequences. `prefer` is kept when it ties.
+  - `BaseSequenceOptimizer` — random valid root-to-leaf, `optimize_constrained`
+    (used by the subassembly plan) and the older enumerating
+    `optimize_scored`, no longer called by `seq_plan`.
   - `DivideOptimizer` ([ASAPx/plan_sequence/optimizer/divide.py](ASAPx/plan_sequence/optimizer/divide.py))
     — builds a per-part obstruction graph from DoF traces, runs a DFS over
     canonical `frozenset({S, R})` partitions, and **propagates** every
@@ -195,12 +199,18 @@ Composed of three plug-in registries (each is a dict in their package
     (convergence curve + per-weight sensitivity scatter + per-assembly
     trajectory). Run as `python ASAPx/plan_sequence/optimizer/plot_weight_history.py`.
 
-`seq_plan(...)` runs the chosen generator+planner to build the tree, then
-(when `seq_optimizer='divide'`) calls `BaseSequenceOptimizer.optimize_scored`,
-which picks the minimum-cost valid sequence; the divide optimizer's split is
-passed in for the debug diagnostic only and does **not** steer that choice.
-The top verified split is persisted into `stats['divide_split']`, and
-`_build_subassembly_plan` then builds the recursive plan on top of it.
+`seq_plan(...)` runs the chosen generator+planner to build the tree. With
+`settings.sequence_selection = "min_cost"` (default) and the `heuristic`
+planner, it then replaces the first complete sequence the search found with
+the cheapest complete one of the tree under the planner's own edge cost
+(`HeuristicDFASequencePlanner.edge_scorer`, `select_min_cost_sequence`):
+no extra physics, milliseconds plus one contact graph. `stats['sequence_selection']`
+records the costs and the first sequence. `"first"` keeps the old behaviour.
+Subclasses of the heuristic planner (gen-adapter, llm, comparison,
+preference) rank by other means and do not select. Then (when
+`seq_optimizer='divide'`) the divide optimizer runs on that sequence; its
+top verified split is persisted into `stats['divide_split']`, and
+`_build_subassembly_plan` builds the recursive plan on top of it.
 
 ### Heuristic cost function — [ASAPx/plan_sequence/planner/heuristic.py](ASAPx/plan_sequence/planner/heuristic.py)
 `HeuristicDFASequencePlanner._cost_child` computes
@@ -443,6 +453,8 @@ Single source of truth for runtime tuning. Notable keys (all already in
   Optuna-trained heuristic weights. Train via `train_heuristic_weights`,
   flip to `"optuna"` for inference. `heuristic_training` configures the
   search (fixed weights, bounds, queued trials, failure stop, pruner, media).
+- `sequence_selection` (`"min_cost"` / `"first"`) — which complete sequence of
+  the explored tree the heuristic planner returns (see "The two planner backends").
 - `divide_weights = {balance, contact, fragmentation}` — DivideOptimizer cut score.
 - `divide_split_threshold` — minimum score for accepting a divide split.
 - `arm_continuous`, `arm_simplified_mode`, `arm_simplified_k_dist`,
@@ -464,6 +476,7 @@ Single source of truth for runtime tuning. Notable keys (all already in
 | Train with parallel workers (cluster) | N concurrent `python main.py train_heuristic_weights --id <ids> --optuna-dir <dir> --optuna-resume --optuna-trials <total> --optuna-timeout <s>` (baselines are split between them) |
 | Test trained weights on held-out assemblies | `python main.py data_heuristic_weights_eval --id <test ids> --optuna-dir <dir>` |
 | Train + test on Euler | `bash cluster/heuristic_weights_submit.sh` (four arrays of `cluster/heuristic_weights.sbatch`: baselines, train, eval_ref, eval; split, sizing and resources in its header) |
+| Bring the result store up to date (import old runs, derive min_cost runs, report) | `bash cluster/store_maintenance_submit.sh` |
 | Same, with the subassembly plan in the test | `bash cluster/heuristic_weights_split_test.sh` (`EVAL_SPLIT=1`: adds the `trained+split` planner) |
 | Plot training history | `python ASAPx/plan_sequence/optimizer/plot_weight_history.py --history assets/heuristic_weights_optuna_history.json --out assets/optuna_training/history.png` |
 | Interactive assembly triage | `python main.py data_filter_assemblies --id 00000-00500 [--allow-gap]` |
@@ -659,10 +672,23 @@ wall time and the plan metrics. So data accumulates across runs: a larger or
 wider test set plans only the new assemblies, a new study reuses every
 (weights, assembly) pair already evaluated, and nothing is mixed across
 changed settings. The fingerprint does not see code changes; the reference
-trial's fresh plan is the check (see above). Runs made before the store:
-`python cluster/import_optuna_run.py <run dir> [--dataset-dir assets/data/asap]`
-copies their records, run outputs, trial runs and cache in (never
-overwriting). The submit script's `STORE_DIR` and `WARM_START` pass through.
+trial's fresh plan is the check (see above). The submit script's `STORE_DIR`
+and `WARM_START` pass through.
+
+`sequence_selection` is part of a heuristic run's fingerprint only when it is
+not `"first"` (runs stored before it existed are `"first"` runs) and always for
+divide runs (whose old sequence choice was different). Store maintenance,
+`cluster/store_tool.py` (on Euler: `bash cluster/store_maintenance_submit.sh`,
+three chained jobs, all resumable): `import` copies run directories made
+before the store in (records, run outputs, trial runs, cache; never
+overwriting); `select` derives for every stored `"first"` heuristic run the
+run `"min_cost"` would have made — planning is identical up to the selection,
+so the stored tree is reused and only a changed sequence is re-timed
+(`plan_arm_sequence` under the run's own fingerprint settings) — and stores it
+under the current fingerprint, verified to equal a fresh run's record; `report`
+writes `<run>/sequence_selection_report.{txt,json}` (history re-scored with
+selected sequences, best trial, store-wide selected / first ratios) and
+`<run>/heuristic_weights_min_cost.json`.
 
 **Evaluation** (`data_heuristic_weights_eval --id <test ids> --optuna-dir DIR`):
 `evaluate_heuristic_weights` plans + arm-times each held-out assembly three
@@ -675,7 +701,7 @@ vs heur-out and heur-out vs reference. `--eval-split` adds a fourth,
 `trained+split` (trained weights + `--seq-optimizer divide`, scored by the
 subassembly timing) and two more totals of that
 run: `trained+split-par` (its parallel time) and `trained+divide` (its flat
-sequence, i.e. the divide optimizer's sequence choice without the split). All
+sequence, timed without the split). All
 are compared with the other three, and the summary reports on how many
 assemblies the plan was used. `--eval-reference-only` plans just the
 two baselines (reference, heur-out), which do not depend on training; the
