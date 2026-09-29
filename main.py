@@ -249,6 +249,18 @@ if __name__ == "__main__":
         "reference weights without sequence selection, and compare them.",
     )
     parser.add_argument(
+        "--eval-reference-first",
+        action="store_true",
+        help="data_heuristic_weights_eval: also the reference weights without sequence "
+        "selection (reference-first).",
+    )
+    parser.add_argument(
+        "--eval-no-wait",
+        action="store_true",
+        help="data_heuristic_weights_eval: return once nothing is left to claim instead "
+        "of waiting for runs other processes hold (large job arrays).",
+    )
+    parser.add_argument(
         "--eval-label",
         type=str,
         default="trained",

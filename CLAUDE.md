@@ -353,12 +353,39 @@ simplified mode), writing `log/timing_overview_split.json`:
   with S and R of every split taken apart at once by separate workers: a split
   block takes prefix + join + max(S, R), recursively (up to 4 workers at depth
   2); same step times, except that the first step of an R block travels from
-  the join. Both come from the same steps, so either can be dropped later.
+  the join. `parallel_2` is the same with two workers (S and R of the
+  outermost split at once, everything nested sequential;
+  `parallel_makespan(workers=k)` shares k out between the halves). All come
+  from the same steps, so any can be dropped later.
 
 Consumers: `data_heuristic_weights_eval --eval-split` (the `trained+split`
 run set: trained weights + divide; its stored records say whether the split
 was `used`, `none`, `infeasible` or `untimed`, plus the flat total) and
 `data_assembly_time`'s `+optimizer` RUNS.
+
+## Part names and step instructions — [core/feedback_generator.py](core/feedback_generator.py)
+
+`name_parts()` groups parts with identical geometry (`part_groups`: volume,
+area, principal inertia; mirror twins land in one group too), names one part
+per group from its four isolated views, its relative size (`_size_text`; mesh
+units are unknown, so sizes are fractions of the assembly) and the two
+assembly-context views that show the most of it (`_context_images`, picked
+from 4 views above + 4 below by visible red pixels, plus an x-ray render when
+under half of it shows). A last call over all groups
+(`_consolidate_part_names`) makes names consistent and distinct, and writes the
+product description. Output: `part_names.json` + `part_names_meta.json`
+(`version`, `assembly_description`, `groups`, drafts). A `part_names.json`
+without a meta file of the current `NAMING_VERSION` is ignored and redone.
+
+`step_instruction(step_idx)` writes each step's text once, in assembly order,
+with the earlier steps' text in the prompt; the manual pages and
+`assembly_instructions.txt` both read that cache. The prompt names the moving
+part, its identical copies already installed, and the installed parts it
+touches (fcl distance within 1% of the assembly diagonal), each with a legend
+colour. The images are the part alone plus an overview and a close-up rendered
+for the VLM in the page's pose and camera direction (`instruction_renders/`:
+blue = moving part seated, red = its start, legend colours = touching parts,
+gray = other installed parts), not the simulation GIF frames.
 
 ## Storage / outputs
 
@@ -482,6 +509,7 @@ Single source of truth for runtime tuning. Notable keys (all already in
 | Train + test on Euler | `bash cluster/heuristic_weights_submit.sh` (four arrays of `cluster/heuristic_weights.sbatch`: baselines, train, eval_ref, eval; split, sizing and resources in its header) |
 | Bring the result store up to date (import old runs, derive min_cost runs, report) | `bash cluster/store_maintenance_submit.sh` |
 | Is the heuristic better than chance? (random decisions on an earlier run's assemblies) | `bash cluster/random_baseline_submit.sh` (`RUN_NAME`, `N_SEEDS`) |
+| Collect planner comparisons on many assemblies (all up to MAX_PARTS, smallest first) | `bash cluster/campaign_submit.sh` (`MAX_PARTS`, `WORKERS`, `CPUS`, `ROUNDS`, `N_SEEDS`) |
 | Same, with the subassembly plan in the test | `bash cluster/heuristic_weights_split_test.sh` (`EVAL_SPLIT=1`: adds the `trained+split` planner) |
 | Plot training history | `python ASAPx/plan_sequence/optimizer/plot_weight_history.py --history assets/heuristic_weights_optuna_history.json --out assets/optuna_training/history.png` |
 | Interactive assembly triage | `python main.py data_filter_assemblies --id 00000-00500 [--allow-gap]` |
@@ -708,13 +736,30 @@ subassembly timing) and two more totals of that
 run: `trained+split-par` (its parallel time) and `trained+divide` (its flat
 sequence, timed without the split). All
 are compared with the other three, and the summary reports on how many
-assemblies the plan was used. `--eval-random N` adds `random` (`dfa-random`,
-seeds 0..N-1, per assembly the geometric mean of its complete seeds; the
-summary lists every seed) and `reference-first` (reference weights,
-`sequence_selection = "first"`), compared with reference, trained and
-heur-out: better than chance, and ranking vs selection. `--eval-label L`
-writes to `DIR/eval_L/`; `cluster/random_baseline_submit.sh` runs it on an
-earlier run's training + test ids. `--eval-reference-only` plans just the
+assemblies the plan was used; `trained+split-2w` is its two-worker time.
+`--eval-random N` adds `random` (`dfa-random`, seeds 0..N-1, per assembly the
+geometric mean of its complete seeds; the summary lists every seed),
+`--eval-reference-first` adds `reference-first` (reference weights,
+`sequence_selection = "first"`). `--eval-label L` writes to `DIR/eval_L/`;
+`cluster/random_baseline_submit.sh` runs both on an earlier run's training +
+test ids. Work goes assembly by assembly in the given order (a run cut short
+leaves whole assemblies), and within one: reference first (it regenerates the
+SDFs the others read), trained before trained+split (each replays the one
+before from the cache); a run whose predecessor another process is still
+planning is left for later, not planned cold beside it. `--eval-no-wait`
+returns once nothing is claimable (wide arrays); `--optuna-timeout 1` plans
+nothing and only writes the summary from the store.
+
+**Data-collection campaign** (`bash cluster/campaign_submit.sh`): every staged
+assembly with `MIN_PARTS..MAX_PARTS` parts except the weights' training
+assemblies, smallest size band first and random within a band
+(`cluster/sample_ids.py`, ids + manifest in the run dir), planned with
+reference, trained, heur-out, trained+split (1 and 2 workers) and random
+(`N_SEEDS`), all through the store: `ROUNDS` chained arrays of `WORKERS x CPUS`
+(default 48 x 16, <= 4 h each) with `--eval-no-wait`, then one summary pass.
+Raising `MAX_PARTS` later plans only the new assemblies.
+`ASAPx/plan_sequence/optimizer/plot_planner_comparison.py --summary
+<run>/eval_campaign/summary.json` draws every series against random. `--eval-reference-only` plans just the
 two baselines (reference, heur-out), which do not depend on training; the
 cluster submit script runs that phase alongside training. Stored runs are
 claimed per assembly through lock files, so several processes split the set,

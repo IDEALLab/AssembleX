@@ -43,6 +43,7 @@ active="$(squeue -u "${USER}" -h -o '%.200j' 2>/dev/null | grep -E "hw_random_${
 mkdir -p "${SCRATCH_DIR}/logs"
 
 job=$(env PHASE=eval RUN_NAME="${RUN_NAME}" IDS="${IDS}" EVAL_RANDOM="${N_SEEDS}" EVAL_LABEL=random \
+      EVAL_REFERENCE_FIRST=1 \
       sbatch --parsable --job-name="hw_random_${RUN_NAME}" --array="0-$(( WORKERS - 1 ))" \
       --cpus-per-task="${CPUS}" --mem-per-cpu="${MEM_PER_CPU}" --time="${LIMIT}" \
       "${REPO_DIR}/cluster/heuristic_weights.sbatch")

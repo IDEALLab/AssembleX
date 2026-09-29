@@ -76,6 +76,11 @@ EVAL_SPLIT="${EVAL_SPLIT:-0}"
 EVAL_RANDOM="${EVAL_RANDOM:-0}"
 # PHASE=eval: the summary goes to <run>/eval_<EVAL_LABEL>/.
 EVAL_LABEL="${EVAL_LABEL:-trained}"
+# PHASE=eval: 1 also plans the reference weights without sequence selection.
+EVAL_REFERENCE_FIRST="${EVAL_REFERENCE_FIRST:-0}"
+# PHASE=eval: 1 = a task ends once nothing is left for it to claim instead of
+# waiting for runs other tasks hold (wide arrays; a summary pass follows).
+EVAL_NO_WAIT="${EVAL_NO_WAIT:-0}"
 
 SCRATCH_DIR="${SCRATCH_DIR:-${SCRATCH:-/cluster/scratch/${USER}}}"
 REPO_DIR="${REPO_DIR:-${SCRATCH_DIR}/AssembleX}"
@@ -195,6 +200,9 @@ else
     echo "could not read the job's remaining time from squeue; using ${TIME_BUDGET_S}s"
 fi
 [ "${TIME_BUDGET_S}" -gt 600 ] || die "time budget ${TIME_BUDGET_S}s is too small; raise --time or lower MARGIN_S"
+# PHASE=eval, EVAL_SUMMARY_ONLY=1: plan nothing, only write the summary from
+# what the store holds (the last pass of a campaign).
+[ "${EVAL_SUMMARY_ONLY:-0}" = "1" ] && TIME_BUDGET_S=1
 echo "time budget for Python: ${TIME_BUDGET_S}s  (job left ${SECONDS_LEFT:-?}s, margin ${MARGIN_S}s)"
 echo "run directory: ${REPO_DIR}/${RUN_DIR}"
 echo "store:         ${REPO_DIR}/${STORE_DIR}"
@@ -236,6 +244,8 @@ case "${PHASE}" in
         CMD=(main.py data_heuristic_weights_eval "${COMMON_ARGS[@]}")
         [ "${EVAL_SPLIT}" = "1" ] && CMD+=(--eval-split)
         [ "${EVAL_RANDOM}" -gt 0 ] && CMD+=(--eval-random "${EVAL_RANDOM}")
+        [ "${EVAL_REFERENCE_FIRST}" = "1" ] && CMD+=(--eval-reference-first)
+        [ "${EVAL_NO_WAIT}" = "1" ] && CMD+=(--eval-no-wait)
         CMD+=(--eval-label "${EVAL_LABEL}")
         ;;
     *) die "PHASE must be baselines, train, eval_ref or eval, not ${PHASE}" ;;
