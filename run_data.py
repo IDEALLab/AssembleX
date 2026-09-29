@@ -573,6 +573,8 @@ def run_data_heuristic_weights_eval(args, test_eval, output_folder, assembly_dir
         time_budget_s=getattr(args, "optuna_timeout", None),
         reference_only=reference_only,
         split=getattr(args, "eval_split", False),
+        random_seeds=getattr(args, "eval_random", 0),
+        label=getattr(args, "eval_label", "trained"),
     )
 
 

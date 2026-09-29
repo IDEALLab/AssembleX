@@ -241,6 +241,20 @@ if __name__ == "__main__":
         "assemblies they were evaluated on they come from the store for free.",
     )
     parser.add_argument(
+        "--eval-random",
+        type=int,
+        default=0,
+        help="data_heuristic_weights_eval: also plan every assembly this many times "
+        "with random decisions (planner dfa-random, seeds 0..N-1) and with the "
+        "reference weights without sequence selection, and compare them.",
+    )
+    parser.add_argument(
+        "--eval-label",
+        type=str,
+        default="trained",
+        help="data_heuristic_weights_eval: summary goes to <run dir>/eval_<label>/.",
+    )
+    parser.add_argument(
         "--eval-reference-only",
         action="store_true",
         help="data_heuristic_weights_eval: plan the test set with the reference "

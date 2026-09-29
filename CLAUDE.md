@@ -156,7 +156,11 @@ Composed of three plug-in registries (each is a dict in their package
 - **Planners** ([ASAPx/plan_sequence/planner/](ASAPx/plan_sequence/planner/))
   — node-selection strategy over the tree. Implementations: `dfs`, `beam`,
   `randseq`, `dfa`, plus the experimental `heuristic`/`llm`/`comparison`/`preference`
-  variants configured via `settings.py`.
+  variants configured via `settings.py`. `dfa-random` (planner/dfa_random.py)
+  is the DFA search with random decisions — each next frontier a seeded uniform
+  sample of the distinct feasible children — the chance baseline for the
+  heuristic (plain `dfa` is not random: with `n_success_term=None` it keeps
+  the first feasible children in part-id order).
 - **Optimizers** ([ASAPx/plan_sequence/optimizer/](ASAPx/plan_sequence/optimizer/))
   — pick a final sequence from a completed tree.
   - `select_min_cost_sequence(tree, edge_cost, prefer=...)` (optimizer/base.py)
@@ -477,6 +481,7 @@ Single source of truth for runtime tuning. Notable keys (all already in
 | Test trained weights on held-out assemblies | `python main.py data_heuristic_weights_eval --id <test ids> --optuna-dir <dir>` |
 | Train + test on Euler | `bash cluster/heuristic_weights_submit.sh` (four arrays of `cluster/heuristic_weights.sbatch`: baselines, train, eval_ref, eval; split, sizing and resources in its header) |
 | Bring the result store up to date (import old runs, derive min_cost runs, report) | `bash cluster/store_maintenance_submit.sh` |
+| Is the heuristic better than chance? (random decisions on an earlier run's assemblies) | `bash cluster/random_baseline_submit.sh` (`RUN_NAME`, `N_SEEDS`) |
 | Same, with the subassembly plan in the test | `bash cluster/heuristic_weights_split_test.sh` (`EVAL_SPLIT=1`: adds the `trained+split` planner) |
 | Plot training history | `python ASAPx/plan_sequence/optimizer/plot_weight_history.py --history assets/heuristic_weights_optuna_history.json --out assets/optuna_training/history.png` |
 | Interactive assembly triage | `python main.py data_filter_assemblies --id 00000-00500 [--allow-gap]` |
@@ -703,7 +708,13 @@ subassembly timing) and two more totals of that
 run: `trained+split-par` (its parallel time) and `trained+divide` (its flat
 sequence, timed without the split). All
 are compared with the other three, and the summary reports on how many
-assemblies the plan was used. `--eval-reference-only` plans just the
+assemblies the plan was used. `--eval-random N` adds `random` (`dfa-random`,
+seeds 0..N-1, per assembly the geometric mean of its complete seeds; the
+summary lists every seed) and `reference-first` (reference weights,
+`sequence_selection = "first"`), compared with reference, trained and
+heur-out: better than chance, and ranking vs selection. `--eval-label L`
+writes to `DIR/eval_L/`; `cluster/random_baseline_submit.sh` runs it on an
+earlier run's training + test ids. `--eval-reference-only` plans just the
 two baselines (reference, heur-out), which do not depend on training; the
 cluster submit script runs that phase alongside training. Stored runs are
 claimed per assembly through lock files, so several processes split the set,

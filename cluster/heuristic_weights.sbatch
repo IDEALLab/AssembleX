@@ -71,6 +71,11 @@ MARGIN_S="${MARGIN_S:-1800}"
 # PHASE=eval: 1 also plans the test split with the trained weights plus the
 # recursive subassembly plan and compares it (--eval-split).
 EVAL_SPLIT="${EVAL_SPLIT:-0}"
+# PHASE=eval: N > 0 also plans the set N times with random decisions and with
+# the reference weights without sequence selection (--eval-random N).
+EVAL_RANDOM="${EVAL_RANDOM:-0}"
+# PHASE=eval: the summary goes to <run>/eval_<EVAL_LABEL>/.
+EVAL_LABEL="${EVAL_LABEL:-trained}"
 
 SCRATCH_DIR="${SCRATCH_DIR:-${SCRATCH:-/cluster/scratch/${USER}}}"
 REPO_DIR="${REPO_DIR:-${SCRATCH_DIR}/AssembleX}"
@@ -230,6 +235,8 @@ case "${PHASE}" in
             || die "no trained weights at ${RUN_DIR}/heuristic_weights.json (did training finish a trial?)"
         CMD=(main.py data_heuristic_weights_eval "${COMMON_ARGS[@]}")
         [ "${EVAL_SPLIT}" = "1" ] && CMD+=(--eval-split)
+        [ "${EVAL_RANDOM}" -gt 0 ] && CMD+=(--eval-random "${EVAL_RANDOM}")
+        CMD+=(--eval-label "${EVAL_LABEL}")
         ;;
     *) die "PHASE must be baselines, train, eval_ref or eval, not ${PHASE}" ;;
 esac
@@ -261,7 +268,7 @@ case "${PHASE}" in
         echo "history: ${REPO_DIR}/${RUN_DIR}/history.json"
         ;;
     eval)
-        SUMMARY="${REPO_DIR}/${RUN_DIR}/eval_trained/summary.txt"
+        SUMMARY="${REPO_DIR}/${RUN_DIR}/eval_${EVAL_LABEL}/summary.txt"
         [ -f "${SUMMARY}" ] && echo "summary: ${SUMMARY}" || echo "no summary written"
         ;;
 esac
