@@ -35,6 +35,13 @@
 # memory no longer hangs its plan until the job limit) and more memory:
 #   MAX_PARTS=30 LIMIT=24:00:00 RUN_TIMEOUT=43200 MEM_PER_CPU=4G ROUNDS=2 \
 #       bash cluster/campaign_submit.sh
+#
+# Testing weights that are still being trained: submit into the training
+# run's own directory and let the first round wait for the training job
+# (AFTER=<job id>, afterany); the weights file is then read when the rounds
+# start, and the training assemblies are excluded from its run_info.txt:
+#   RUN_NAME=<train run> WEIGHTS_RUN=<train run> RESUME=1 AFTER=<train job> \
+#       bash cluster/campaign_submit.sh
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -55,19 +62,24 @@ ROUNDS="${ROUNDS:-3}"
 MEM_PER_CPU="${MEM_PER_CPU:-2G}"
 # Per-plan wall-clock limit in seconds (empty = none).
 RUN_TIMEOUT="${RUN_TIMEOUT:-}"
+# Job id(s) the first round waits for (afterany), e.g. the training job.
+AFTER="${AFTER:-}"
 
 RUN_PATH="${REPO_DIR}/assets/optuna_runs/${RUN_NAME}"
 SBATCH_SCRIPT="${REPO_DIR}/cluster/heuristic_weights.sbatch"
 
-active="$(squeue -u "${USER}" -h -o '%.200j' 2>/dev/null | grep -E "_${RUN_NAME}\$" || true)"
-[ -z "${active}" ] || { echo "ERROR: jobs of ${RUN_NAME} are already queued or running" >&2; exit 1; }
+active="$(squeue -u "${USER}" -h -o '%.200j' 2>/dev/null | grep -E "hw_(campaign|summary)_${RUN_NAME}\$" || true)"
+[ -z "${active}" ] || { echo "ERROR: campaign jobs of ${RUN_NAME} are already queued or running" >&2; exit 1; }
 if [ -e "${RUN_PATH}/run_info.txt" ] && [ "${RESUME:-0}" != "1" ]; then
     echo "ERROR: ${RUN_PATH} exists; pick another RUN_NAME or set RESUME=1 to continue it" >&2
     exit 1
 fi
-[ -f "${REPO_DIR}/${TRAINED_WEIGHTS}" ] || { echo "ERROR: no ${TRAINED_WEIGHTS}" >&2; exit 1; }
+# With AFTER the weights may not exist yet: the job it waits for writes them.
+[ -n "${AFTER}" ] || [ -f "${REPO_DIR}/${TRAINED_WEIGHTS}" ] || { echo "ERROR: no ${TRAINED_WEIGHTS}" >&2; exit 1; }
 mkdir -p "${RUN_PATH}" "${SCRATCH_DIR}/logs"
-cp "${REPO_DIR}/${TRAINED_WEIGHTS}" "${RUN_PATH}/heuristic_weights.json"
+if [ -f "${REPO_DIR}/${TRAINED_WEIGHTS}" ] && ! [ "${REPO_DIR}/${TRAINED_WEIGHTS}" -ef "${RUN_PATH}/heuristic_weights.json" ]; then
+    cp "${REPO_DIR}/${TRAINED_WEIGHTS}" "${RUN_PATH}/heuristic_weights.json"
+fi
 
 if [ ! -f "${RUN_PATH}/ids.txt" ]; then
     train_ids="$(grep -oE '^train: .*ids [0-9,]+' "${REPO_DIR}/assets/optuna_runs/${WEIGHTS_RUN}/run_info.txt" \
@@ -90,6 +102,7 @@ submit() {  # submit NAME SUMMARY_ONLY [sbatch args...] -> job id
 }
 jobs=()
 dep=()
+[ -z "${AFTER}" ] || dep=(--dependency="afterany:${AFTER}")
 for r in $(seq 1 "${ROUNDS}"); do
     j=$(submit "campaign" 0 --array="0-$(( WORKERS - 1 ))" --cpus-per-task="${CPUS}" \
         --time="${LIMIT}" ${dep[@]+"${dep[@]}"})
@@ -108,6 +121,7 @@ summary=$(submit "summary" 1 --array=0 --cpus-per-task=2 --time=01:00:00 ${dep[@
     echo "rounds:     ${jobs[*]} (${WORKERS} x ${CPUS} cores, ${LIMIT} each), summary ${summary}"
     echo "random:     ${N_SEEDS} seed(s) per assembly"
     echo "limits:     task ${LIMIT}, per plan ${RUN_TIMEOUT:-none} s, ${MEM_PER_CPU} per core"
+    echo "after:      ${AFTER:-none}"
 } | tee -a "${RUN_PATH}/run_info.txt"
 
 cat <<EOF
