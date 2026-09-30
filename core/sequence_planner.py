@@ -299,6 +299,35 @@ def _extract_step_details(tree, sequence=None):
     return steps
 
 
+def _record_split_choice(log_dir, stats, split_overview):
+    """Decide whether the timed subassembly plan is carried out
+    (plan_robot/split_timing.choose_split, settings.subassembly_only_if_faster
+    / subassembly_workers) and store it as stats['subassembly_choice']."""
+    from ASAPx.plan_robot.split_timing import choose_split
+
+    try:
+        with open(Path(log_dir) / "timing_overview.json") as f:
+            flat = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        flat = None
+    choice = choose_split(
+        flat,
+        split_overview,
+        workers=getattr(settings, "subassembly_workers", 1),
+        only_if_faster=getattr(settings, "subassembly_only_if_faster", True),
+    )
+    stats["subassembly_choice"] = choice
+    tmp = Path(log_dir) / f"stats.json.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(stats, f)
+    os.replace(tmp, Path(log_dir) / "stats.json")
+    print(
+        f"[sequence_planner] subassembly plan {'carried out' if choice['adopt'] else 'not used'}: "
+        f"{choice['reason']} (flat {choice['flat_s']}, split {choice['split_s']}, "
+        f"{choice['workers']} worker(s))"
+    )
+
+
 class SequencePlanner:
     def __init__(self, assembly):
         self.assembly = assembly
@@ -1053,6 +1082,33 @@ class SequencePlanner:
 
         if plan_sequence and getattr(settings, "render_sequence", True):
             self._render_plan(asset_folder, assembly_dir, plan_sequence, tree, args)
+            # The subassembly plan is carried out only where _render_plan's
+            # timing found it faster (settings.subassembly_only_if_faster);
+            # otherwise the manual and the order follow the flat sequence.
+            try:
+                with open(os.path.join(log_dir, "stats.json")) as f:
+                    _choice = json.load(f).get("subassembly_choice") or {}
+            except (OSError, json.JSONDecodeError):
+                _choice = {}
+            if split_steps and _choice.get("adopt") is False:
+                sequence = plan_sequence
+                missing = set(self.assembly.objects.keys()) - set(plan_sequence)
+                if assemblable and missing:
+                    sequence = plan_sequence + list(missing)
+                split_plan, split_steps = None, []
+                with open(seq_file_path, "w") as f:
+                    json.dump(
+                        {
+                            "sequence": sequence,
+                            "assemblable": assemblable,
+                            "steps": step_details,
+                            "tool_decisions": tool_decisions,
+                            "split_plan": None,
+                            "split_steps": [],
+                            "subassembly_choice": _choice,
+                        },
+                        f,
+                    )
 
         self.update_sequence(sequence)
         self._apply_step_details(step_details)
@@ -1285,7 +1341,7 @@ class SequencePlanner:
 
                     _setup_path = _log_dir / "setup.json"
                     _setup = json.load(open(_setup_path)) if _setup_path.exists() else {}
-                    time_split_plan(
+                    _split_overview = time_split_plan(
                         asset_folder,
                         os.path.join(asap_dir, "assets"),
                         assembly_dir,
@@ -1298,6 +1354,7 @@ class SequencePlanner:
                         gripper_type=_gripper_type,
                         gripper_scale=_gripper_scale,
                     )
+                    _record_split_choice(_log_dir, _split_stats, _split_overview)
             except Exception as _split_e:
                 print(f"[sequence_planner] subassembly timing failed: {_split_e}")
                 import traceback as _tb
@@ -1434,6 +1491,9 @@ class SequencePlanner:
                     _stats = json.load(f)
                 divide_split = _stats.get("divide_split")
                 split_plan = _stats.get("split_plan")
+                if (_stats.get("subassembly_choice") or {}).get("adopt") is False:
+                    # The flat sequence is what gets carried out.
+                    divide_split = split_plan = None
             except (json.JSONDecodeError, OSError):
                 divide_split = split_plan = None
         if split_plan:

@@ -450,6 +450,16 @@ subassembly_sweep_states = True
 # bottleneck.
 subassembly_sweep_max_states = None
 
+# Carry out the subassembly plan only where the timing model predicts it faster
+# than the flat sequence (plan_robot/split_timing.choose_split); otherwise the
+# run, its manual and its renders follow the flat sequence. Needs the plan to be
+# timed (arm pipeline, simplified mode); an untimed plan is carried out as
+# before. False = always carry out a found plan.
+subassembly_only_if_faster = True
+# Workers the comparison assumes: 1 (sequential), 2 (S and R of the outermost
+# split at once) or None (every split at once).
+subassembly_workers = 1
+
 # Manual page framing per subassembly side: outline colour for pages whose step
 # belongs to the S block and the R block. Nested blocks get one ring per level,
 # outermost = top-level side. RGB tuples.

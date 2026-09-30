@@ -358,6 +358,19 @@ simplified mode), writing `log/timing_overview_split.json`:
   `parallel_makespan(workers=k)` shares k out between the halves). All come
   from the same steps, so any can be dropped later.
 
+Whether the plan is then carried out is decided right after this timing
+(`choose_split`, `SequencePlanner._render_plan` -> `stats['subassembly_choice']`):
+with `settings.subassembly_only_if_faster` (default on) only where it is
+predicted faster than the flat sequence with `settings.subassembly_workers`
+(1 = sequential, 2 = `parallel_2`, None = `parallel`); otherwise
+`sequence.json`, the manual and the subassembly renders fall back to the flat
+sequence, and `data_assembly_time`'s `+optimizer` RUNS score the flat timing.
+An untimed plan is carried out as before. The evaluation keeps storing the
+plan's own times and reports `trained+best-1w` / `trained+best-2w` (per
+assembly the faster of `trained` and the plan with 1 / 2 workers -- the
+planner's default); `trained+split` / `-2w` / `-par` are the plan carried out
+everywhere (plot: `--show-forced`).
+
 Consumers: `data_heuristic_weights_eval --eval-split` (the `trained+split`
 run set: trained weights + divide; its stored records say whether the split
 was `used`, `none`, `infeasible` or `untimed`, plus the flat total) and

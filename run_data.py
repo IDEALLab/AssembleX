@@ -1620,15 +1620,28 @@ def run_data_assembly_time(args, test_eval, output_folder, assembly_dir):
                                 split = json.load(_f)
                         except Exception:
                             split = None
-                    if split is not None and split.get("status") == "ok":
+                    # Follow the run's own choice (settings.subassembly_only_if_faster):
+                    # the plan's timing where it was carried out, else the flat one.
+                    try:
+                        with open(output_run_dir / "log" / "stats.json") as _f:
+                            choice = json.load(_f).get("subassembly_choice") or {}
+                    except (OSError, json.JSONDecodeError):
+                        choice = {}
+                    if (split is not None and split.get("status") == "ok"
+                            and choice.get("adopt", True)):
                         split["flat_totals"] = overview.get("totals")
                         split["note"] = "subassembly_plan"
+                        split["subassembly_choice"] = choice
                         overview = split
                     else:
                         overview["note"] = (
-                            "no_subassembly_plan" if split is None
+                            "no_subassembly_plan"
+                            if split is None
                             else f"subassembly_plan_infeasible: {split.get('failure')}"
+                            if split.get("status") != "ok"
+                            else f"subassembly_plan_not_faster: {choice.get('reason')}"
                         )
+                        overview["subassembly_choice"] = choice
                     overview["status"] = "ok"
                 results[ass.id][run_label] = overview
                 totals = overview.get("totals", {})
