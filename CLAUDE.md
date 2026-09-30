@@ -776,7 +776,12 @@ reference, trained, heur-out, trained+split (1 and 2 workers) and random
 (default 48 x 16, <= 4 h each) with `--eval-no-wait`, then one summary pass.
 Raising `MAX_PARTS` later plans only the new assemblies.
 `ASAPx/plan_sequence/optimizer/plot_planner_comparison.py --summary
-<run>/eval_campaign/summary.json` draws every series against random. `--eval-reference-only` plans just the
+<run>/eval_campaign/summary.json` draws every series against random;
+`plot_time_components.py` (same arguments) the mean time per assembly split
+into the timing components, and the mean parts held per assembly (flat plans
+from the tree, subassembly plans from their timing's per-step hold_count,
+recorded as `split_metrics` and backfilled from the run's split timing when a
+record is read). `--eval-reference-only` plans just the
 two baselines (reference, heur-out), which do not depend on training; the
 cluster submit script runs that phase alongside training. Stored runs are
 claimed per assembly through lock files, so several processes split the set,
