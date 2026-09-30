@@ -367,8 +367,9 @@ predicted faster than the flat sequence with `settings.subassembly_workers`
 sequence, and `data_assembly_time`'s `+optimizer` RUNS score the flat timing.
 An untimed plan is carried out as before. The evaluation keeps storing the
 plan's own times and reports `trained+best-1w` / `trained+best-2w` (per
-assembly the faster of `trained` and the plan with 1 / 2 workers -- the
-planner's default); `trained+split` / `-2w` / `-par` are the plan carried out
+assembly the faster of the subassembly run's own flat sequence and its plan
+with 1 / 2 workers, exactly as the pipeline decides -- the planner's
+default); `trained+split` / `-2w` / `-par` are the plan carried out
 everywhere (plot: `--show-forced`).
 
 Consumers: `data_heuristic_weights_eval --eval-split` (the `trained+split`
@@ -778,10 +779,11 @@ Raising `MAX_PARTS` later plans only the new assemblies.
 `ASAPx/plan_sequence/optimizer/plot_planner_comparison.py --summary
 <run>/eval_campaign/summary.json` draws every series against random;
 `plot_time_components.py` (same arguments) the mean time per assembly split
-into the timing components, and the mean parts held per assembly (flat plans
-from the tree, subassembly plans from their timing's per-step hold_count,
-recorded as `split_metrics` and backfilled from the run's split timing when a
-record is read). `--eval-reference-only` plans just the
+into the timing components, the mean parts held per assembly and the mean
+pull direction per step (flat plans from the tree; subassembly plans from
+their timing's per-step hold_count and the removals' pulls, which the split
+timing records since 2026-09-30, stored as `split_metrics` and backfilled from
+the run's split timing when a record is read). `--eval-reference-only` plans just the
 two baselines (reference, heur-out), which do not depend on training; the
 cluster submit script runs that phase alongside training. Stored runs are
 claimed per assembly through lock files, so several processes split the set,
