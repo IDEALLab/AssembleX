@@ -26,6 +26,15 @@
 # Sizing: ~10-15 core-hours per assembly up to 20 parts (all five planners,
 # 1 random seed), so ~150 assemblies take ~2000 core-hours: 48 x 16 cores
 # (768, 4x the 192 of the last run) about 4-5 h, i.e. two rounds.
+#
+# Larger assemblies: plans grow steeply with size (cold reference plan on 16
+# cores, 2026-09-29 campaign: median 7 min at 5-9 parts, 47 min at 18-20, the
+# longest 176 min at 16 parts), so past 20 parts give each task a longer
+# LIMIT than a plan can take, a per-plan RUN_TIMEOUT (seconds; a plan over it
+# is killed with its workers and stored as 'timeout', so a worker killed for
+# memory no longer hangs its plan until the job limit) and more memory:
+#   MAX_PARTS=30 LIMIT=24:00:00 RUN_TIMEOUT=43200 MEM_PER_CPU=4G ROUNDS=2 \
+#       bash cluster/campaign_submit.sh
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,6 +53,8 @@ CPUS="${CPUS:-16}"
 LIMIT="${LIMIT:-04:00:00}"
 ROUNDS="${ROUNDS:-3}"
 MEM_PER_CPU="${MEM_PER_CPU:-2G}"
+# Per-plan wall-clock limit in seconds (empty = none).
+RUN_TIMEOUT="${RUN_TIMEOUT:-}"
 
 RUN_PATH="${REPO_DIR}/assets/optuna_runs/${RUN_NAME}"
 SBATCH_SCRIPT="${REPO_DIR}/cluster/heuristic_weights.sbatch"
@@ -73,7 +84,7 @@ submit() {  # submit NAME SUMMARY_ONLY [sbatch args...] -> job id
     shift 2
     env PHASE=eval RUN_NAME="${RUN_NAME}" IDS="${IDS}" ASSEMBLY_SUBDIR="${ASSEMBLY_SUBDIR}" \
         EVAL_SPLIT=1 EVAL_RANDOM="${N_SEEDS}" EVAL_LABEL=campaign EVAL_NO_WAIT=1 \
-        EVAL_SUMMARY_ONLY="${summary_only}" \
+        EVAL_SUMMARY_ONLY="${summary_only}" EVAL_RUN_TIMEOUT="${RUN_TIMEOUT}" \
         sbatch --parsable --job-name="hw_${name}_${RUN_NAME}" --mem-per-cpu="${MEM_PER_CPU}" \
         "$@" "${SBATCH_SCRIPT}"
 }
@@ -96,6 +107,7 @@ summary=$(submit "summary" 1 --array=0 --cpus-per-task=2 --time=01:00:00 ${dep[@
     echo "weights:    ${TRAINED_WEIGHTS}"
     echo "rounds:     ${jobs[*]} (${WORKERS} x ${CPUS} cores, ${LIMIT} each), summary ${summary}"
     echo "random:     ${N_SEEDS} seed(s) per assembly"
+    echo "limits:     task ${LIMIT}, per plan ${RUN_TIMEOUT:-none} s, ${MEM_PER_CPU} per core"
 } | tee -a "${RUN_PATH}/run_info.txt"
 
 cat <<EOF

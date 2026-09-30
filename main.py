@@ -261,6 +261,13 @@ if __name__ == "__main__":
         "of waiting for runs other processes hold (large job arrays).",
     )
     parser.add_argument(
+        "--eval-run-timeout",
+        type=float,
+        default=None,
+        help="data_heuristic_weights_eval: wall-clock limit per plan in seconds; a plan "
+        "over it is killed (with its workers) and stored as 'timeout'.",
+    )
+    parser.add_argument(
         "--eval-label",
         type=str,
         default="trained",

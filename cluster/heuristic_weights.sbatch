@@ -81,6 +81,9 @@ EVAL_REFERENCE_FIRST="${EVAL_REFERENCE_FIRST:-0}"
 # PHASE=eval: 1 = a task ends once nothing is left for it to claim instead of
 # waiting for runs other tasks hold (wide arrays; a summary pass follows).
 EVAL_NO_WAIT="${EVAL_NO_WAIT:-0}"
+# PHASE=eval: wall-clock limit per plan in seconds (killed and stored as
+# 'timeout'; empty = none).
+EVAL_RUN_TIMEOUT="${EVAL_RUN_TIMEOUT:-}"
 
 SCRATCH_DIR="${SCRATCH_DIR:-${SCRATCH:-/cluster/scratch/${USER}}}"
 REPO_DIR="${REPO_DIR:-${SCRATCH_DIR}/AssembleX}"
@@ -246,6 +249,7 @@ case "${PHASE}" in
         [ "${EVAL_RANDOM}" -gt 0 ] && CMD+=(--eval-random "${EVAL_RANDOM}")
         [ "${EVAL_REFERENCE_FIRST}" = "1" ] && CMD+=(--eval-reference-first)
         [ "${EVAL_NO_WAIT}" = "1" ] && CMD+=(--eval-no-wait)
+        [ -n "${EVAL_RUN_TIMEOUT}" ] && CMD+=(--eval-run-timeout "${EVAL_RUN_TIMEOUT}")
         CMD+=(--eval-label "${EVAL_LABEL}")
         ;;
     *) die "PHASE must be baselines, train, eval_ref or eval, not ${PHASE}" ;;

@@ -748,7 +748,11 @@ SDFs the others read), trained before trained+split (each replays the one
 before from the cache); a run whose predecessor another process is still
 planning is left for later, not planned cold beside it. `--eval-no-wait`
 returns once nothing is claimable (wide arrays); `--optuna-timeout 1` plans
-nothing and only writes the summary from the store.
+nothing and only writes the summary from the store (it still reads every
+stored run). `--eval-run-timeout S` plans each run in a forked child leading
+its own process group and kills the group after S seconds (status
+`timeout`, stored with the limit; a later run with a longer limit plans it
+again) -- this also ends a plan hung on a worker killed for memory.
 
 **Data-collection campaign** (`bash cluster/campaign_submit.sh`): every staged
 assembly with `MIN_PARTS..MAX_PARTS` parts except the weights' training
