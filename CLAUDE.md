@@ -357,6 +357,13 @@ simplified mode), writing `log/timing_overview_split.json`:
   outermost split at once, everything nested sequential;
   `parallel_makespan(workers=k)` shares k out between the halves). All come
   from the same steps, so any can be dropped later.
+- `heuristic_cost` (heuristic runs): the plan scored by the heuristic
+  planner's own cost under the run's weights (`plan_heuristic_cost`): each
+  removal as resolved, on the body it comes off (the other side set aside at
+  a join counts as removed), joins left out; `total` (sequential),
+  `parallel_2`, next to `flat` (the selected sequence's cost). Recorded for a
+  split decision that does not use the timing model; nothing decides by it
+  yet. A plan has one removal fewer per join than the flat sequence.
 
 Whether the plan is then carried out is decided right after this timing
 (`choose_split`, `SequencePlanner._render_plan` -> `stats['subassembly_choice']`):
@@ -740,7 +747,11 @@ so the stored tree is reused and only a changed sequence is re-timed
 under the current fingerprint, verified to equal a fresh run's record; `report`
 writes `<run>/sequence_selection_report.{txt,json}` (history re-scored with
 selected sequences, best trial, store-wide selected / first ratios) and
-`<run>/heuristic_weights_min_cost.json`.
+`<run>/heuristic_weights_min_cost.json`. Two analysis commands of the same
+tool: `split-features` (plan structure and timings per stored subassembly
+run; login node) and `split-cost` (the same runs scored by the heuristic
+cost, plan vs flat; container: `PHASE=split-cost sbatch
+cluster/store_maintenance.sbatch`).
 
 **Evaluation** (`data_heuristic_weights_eval --id <test ids> --optuna-dir DIR`):
 `evaluate_heuristic_weights` plans + arm-times each held-out assembly three

@@ -16,12 +16,16 @@
 #           reuses it (array; tasks share the work through per-run locks);
 #   report  per run directory: training history re-scored with selected
 #           sequences, best trial and weights, store-wide time ratios.
+#   split-cost  every stored subassembly run with a timed plan scored by the
+#           heuristic cost (plan removals vs flat sequence) into
+#           assets/optuna_runs/split_cost.csv (one task; submit directly:
+#           PHASE=split-cost sbatch --job-name=store_split-cost cluster/store_maintenance.sbatch).
 # Submit through cluster/store_maintenance_submit.sh, which chains the three.
 # Every phase is safe to repeat and resumes where an earlier one stopped.
 
 set -euo pipefail
 
-PHASE="${PHASE:?set PHASE to import, select or report}"
+PHASE="${PHASE:?set PHASE to import, select, report or split-cost}"
 ASSEMBLY_SUBDIR="${ASSEMBLY_SUBDIR:-data/asap}"
 STORE_DIR="${STORE_DIR:-assets/optuna_store}"
 # Seconds kept free at the end of the job (select stops starting runs then).
@@ -87,6 +91,9 @@ case "${PHASE}" in
     report)
         CMD=("${TOOL[@]}" report "${RUN_DIRS[@]}" --store "${STORE_DIR}")
         ;;
-    *) die "PHASE must be import, select or report, not ${PHASE}" ;;
+    split-cost)
+        CMD=("${TOOL[@]}" split-cost --store "${STORE_DIR}" --num-proc "${NUM_PROC}")
+        ;;
+    *) die "PHASE must be import, select, report or split-cost, not ${PHASE}" ;;
 esac
 in_container "${CMD[@]}"

@@ -20,6 +20,13 @@
         timing model gave the plan and the run's flat sequence. The data for a
         split decision that does not use the timing model. Standard library
         only, so it runs on a login node.
+    python cluster/store_tool.py split-cost [--out <csv>] [--num-proc N]
+        Every stored subassembly run with a timed plan, scored by the
+        heuristic planner's own cost under the run's weights: the plan's
+        removals (joins left out; split_timing.plan_heuristic_cost), resolved
+        again through the store's candidate-check cache, next to the flat
+        sequence's cost and both timings. Needs the container (physics
+        imports); a cache miss is simulated on --num-proc workers.
     python cluster/store_tool.py repick <run dir> [--tolerance 0.15] [--out <json>]
         Pick a multi-objective run's weights again from its history.json, e.g.
         with another pareto_tolerance (weight_trainer.repick_run); writes
@@ -125,9 +132,84 @@ def split_features(store, out):
     print(f'{len(rows)} divide runs, {with_plan} with a plan, {timed} timed ok -> {out}')
 
 
+SPLIT_COST_COLUMNS = ('id', 'n_parts', 'record', 'flat_s', 'split_1w_s', 'split_2w_s',
+                      'flat_cost', 'split_cost', 'split_cost_2w', 'n_flat_removals',
+                      'n_removals', 'n_joins', 'error')
+
+
+def split_cost(store, out, num_proc):
+    import settings
+    from plan_robot.split_timing import (resolve_split_steps, plan_heuristic_cost,
+                                         sequence_heuristic_cost)
+
+    rows = []
+    paths = sorted(glob.glob(os.path.join(store, 'runs', '*', '*.json')))
+    for path in paths:
+        if path.endswith(('assembly.json', '.weights.json')):
+            continue
+        with open(path) as f:
+            rec = json.load(f)
+        fp = rec.get('fingerprint') or {}
+        if fp.get('seq_optimizer') != 'divide' or rec.get('status') != 'ok' or rec.get('split') != 'used':
+            continue
+        row = {'id': rec.get('id'), 'n_parts': rec.get('n_parts'), 'record': os.path.relpath(path, store),
+               'flat_s': rec.get('flat_total_s'), 'split_1w_s': rec.get('total_s'),
+               'split_2w_s': rec.get('parallel2_total_s'), 'n_joins': rec.get('n_joins')}
+        try:
+            log = os.path.join(path[:-len('.json')] + '_run', 'log')
+            with open(os.path.join(log, 'stats.json')) as f:
+                stats = json.load(f)
+            setup = {}
+            if os.path.exists(os.path.join(log, 'setup.json')):
+                with open(os.path.join(log, 'setup.json')) as f:
+                    setup = json.load(f)
+            # The flat sequence the plan competes with (a 'tree' plan replaced
+            # stats['sequence'] and kept it as flat_sequence), scored from the
+            # tree under the run's weights.
+            import pickle
+            from plan_sequence.planner.heuristic import HeuristicDFASequencePlanner
+            with open(os.path.join(log, 'tree.pkl'), 'rb') as f:
+                tree = pickle.load(f)
+            flat_seq = stats.get('flat_sequence') or stats.get('sequence') or []
+            edge_cost = HeuristicDFASequencePlanner.edge_scorer(
+                os.path.abspath('assets'), rec['assembly_dir'], sorted(max(tree.nodes, key=len)),
+                fp['weights'])
+            flat_cost = sequence_heuristic_cost(tree, flat_seq, edge_cost)
+            if flat_cost is None:
+                raise ValueError('flat sequence leaves the tree')
+            steps, failure = resolve_split_steps(
+                os.path.abspath('assets'), rec['assembly_dir'], stats['split_plan'],
+                stats.get('split_steps') or [],
+                max_poses=int(setup.get('max_poses', 3)), max_grippers=setup.get('max_grippers', 3),
+                get_dof=bool(getattr(settings, 'get_dof', False)),
+                skip_stability=bool(getattr(settings, 'skip_stability', False)),
+                allow_gap=False, ignore_unstable=stats.get('ignored_unstable_parts') or (),
+                optimizer=setup.get('optimizer', 'L-BFGS-B'), num_proc=num_proc,
+                sim_cache_dir=os.path.join(store, 'sim_cache'))
+            if failure is not None:
+                raise ValueError(f'plan not resolvable again: {failure}')
+            cost = plan_heuristic_cost(os.path.abspath('assets'), rec['assembly_dir'],
+                                       stats['split_plan'], steps, fp['weights'])
+            row.update({'flat_cost': flat_cost, 'split_cost': cost['total'],
+                        'split_cost_2w': cost['parallel_2'], 'n_removals': cost['n_removals'],
+                        'n_flat_removals': len(flat_seq)})
+        except Exception as e:
+            row['error'] = f'{type(e).__name__}: {e}'[:300]
+        rows.append(row)
+        print(f"[split-cost] {row['id']}: flat {row.get('flat_cost')} split {row.get('split_cost')}"
+              + (f" ERROR {row['error']}" if row.get('error') else ''), flush=True)
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    with open(out, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=SPLIT_COST_COLUMNS)
+        w.writeheader()
+        for row in rows:
+            w.writerow({k: row.get(k) for k in SPLIT_COST_COLUMNS})
+    print(f'{len(rows)} timed subassembly plans, {sum(not r.get("error") for r in rows)} scored -> {out}')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('command', choices=('import', 'select', 'report', 'split-features', 'repick'))
+    parser.add_argument('command', choices=('import', 'select', 'report', 'split-features', 'repick', 'split-cost'))
     parser.add_argument('run_dirs', nargs='*')
     parser.add_argument('--store', default=None)
     parser.add_argument('--dataset-dir', default=os.path.join('assets', 'data', 'asap'))
@@ -144,6 +226,11 @@ def main():
         return
     out_given = '--out' in sys.argv
     sys.path[:0] = [os.path.join(ROOT, 'ASAPx'), ROOT]
+    if args.command == 'split-cost':
+        split_cost(args.store or os.path.join('assets', 'optuna_store'),
+                   args.out if out_given else os.path.join('assets', 'optuna_runs', 'split_cost.csv'),
+                   args.num_proc)
+        return
     if args.command == 'repick':
         # weight_trainer by file: the package __init__ pulls in networkx and
         # the physics, which a login node's python does not have.
