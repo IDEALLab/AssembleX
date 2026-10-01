@@ -654,7 +654,7 @@ averaged over the assemblies. The study finds the Pareto front, written to
 `<weights>_pareto.json` (`DIR/heuristic_weights_pareto.json`), and
 `pareto_pick` chooses the weights from it: `no_worse_than_reference` (the
 fastest front trial at most `1 + pareto_tolerance` times as bad as the
-reference weights on each of the others, default 15%; the queued reference
+reference weights on each of the others, default 20%; the queued reference
 trial always qualifies) or `fastest`. With no tolerance the 2026-09-30 study
 picked the reference weights themselves: no trial was faster and no worse on
 both held parts and pull direction. `cluster/store_tool.py repick <run>
