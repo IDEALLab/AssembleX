@@ -377,7 +377,9 @@ plan's own times and reports `trained+best-1w` / `trained+best-2w` (per
 assembly the faster of the subassembly run's own flat sequence and its plan
 with 1 / 2 workers, exactly as the pipeline decides -- the planner's
 default); `trained+split` / `-2w` / `-par` are the plan carried out
-everywhere (plot: `--show-forced`).
+everywhere. The plots draw the latter by default, since the timing model
+that would choose also scores the result; `plot_planner_comparison.py
+--where-faster` adds the timing-based choice.
 
 Consumers: `data_heuristic_weights_eval --eval-split` (the `trained+split`
 run set: trained weights + divide; its stored records say whether the split
