@@ -653,10 +653,15 @@ objective of its own instead — per-step means of `len(parts_fix)` and of
 averaged over the assemblies. The study finds the Pareto front, written to
 `<weights>_pareto.json` (`DIR/heuristic_weights_pareto.json`), and
 `pareto_pick` chooses the weights from it: `no_worse_than_reference` (the
-fastest front trial at most as bad as the reference weights on the others;
-the queued reference trial always qualifies) or `fastest`. Optuna does not
-prune multi-objective studies, so every trial is a full pass. The eval
-summary reports both metrics per paired comparison.
+fastest front trial at most `1 + pareto_tolerance` times as bad as the
+reference weights on each of the others, default 15%; the queued reference
+trial always qualifies) or `fastest`. With no tolerance the 2026-09-30 study
+picked the reference weights themselves: no trial was faster and no worse on
+both held parts and pull direction. `cluster/store_tool.py repick <run>
+[--tolerance T] [--out F]` picks again from a run's `history.json` without
+the study (`weight_trainer.repick_run`, no optuna or physics imports, runs on
+a login node). Optuna does not prune multi-objective studies, so every trial
+is a full pass. The eval summary reports both metrics per paired comparison.
 
 **Search space**: the cost only ranks candidates, so it is invariant to
 scaling all weights. `hold_count` is pinned to `time_per_held_part_s` (every

@@ -538,9 +538,13 @@ heuristic_training = {
     # pruning off, so every trial is a full pass. ("time",) is the plain study.
     "objectives": ("time", "held_parts", "non_upward"),
     # Which Pareto trial becomes the weights: "no_worse_than_reference" = the
-    # fastest one at most as bad as the reference weights on the others;
-    # "fastest" ignores them.
+    # fastest one at most as bad as the reference weights on the others, up
+    # to pareto_tolerance (0.15 = up to 15% worse on each); "fastest" ignores
+    # them. With no tolerance the reference weights were the only qualifying
+    # trial of the 2026-09-30 study (mo_20260930): no weight set was faster
+    # and no worse on both held parts and pull direction.
     "pareto_pick": "no_worse_than_reference",
+    "pareto_tolerance": 0.15,
 }
 
 
