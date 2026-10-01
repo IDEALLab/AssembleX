@@ -71,6 +71,9 @@ MARGIN_S="${MARGIN_S:-1800}"
 # PHASE=eval: 1 also plans the test split with the trained weights plus the
 # recursive subassembly plan and compares it (--eval-split).
 EVAL_SPLIT="${EVAL_SPLIT:-0}"
+# PHASE=eval: 1 also plans the subassembly run with every block of the plan
+# re-planned on its own (--eval-split-replan; implies EVAL_SPLIT).
+EVAL_SPLIT_REPLAN="${EVAL_SPLIT_REPLAN:-0}"
 # PHASE=eval: N > 0 also plans the set N times with random decisions and with
 # the reference weights without sequence selection (--eval-random N).
 EVAL_RANDOM="${EVAL_RANDOM:-0}"
@@ -246,6 +249,7 @@ case "${PHASE}" in
             || die "no trained weights at ${RUN_DIR}/heuristic_weights.json (did training finish a trial?)"
         CMD=(main.py data_heuristic_weights_eval "${COMMON_ARGS[@]}")
         [ "${EVAL_SPLIT}" = "1" ] && CMD+=(--eval-split)
+        [ "${EVAL_SPLIT_REPLAN}" = "1" ] && CMD+=(--eval-split-replan)
         [ "${EVAL_RANDOM}" -gt 0 ] && CMD+=(--eval-random "${EVAL_RANDOM}")
         [ "${EVAL_REFERENCE_FIRST}" = "1" ] && CMD+=(--eval-reference-first)
         [ "${EVAL_NO_WAIT}" = "1" ] && CMD+=(--eval-no-wait)

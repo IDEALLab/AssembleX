@@ -578,6 +578,7 @@ def run_data_heuristic_weights_eval(args, test_eval, output_folder, assembly_dir
         reference_first=getattr(args, "eval_reference_first", False),
         wait_for_others=not getattr(args, "eval_no_wait", False),
         run_timeout_s=getattr(args, "eval_run_timeout", None),
+        split_replan=getattr(args, "eval_split_replan", False),
     )
 
 

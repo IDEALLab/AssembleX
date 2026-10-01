@@ -459,6 +459,12 @@ subassembly_only_if_faster = True
 # Workers the comparison assumes: 1 (sequential), 2 (S and R of the outermost
 # split at once) or None (every split at once).
 subassembly_workers = 1
+# Re-plan every leaf block of the subassembly plan on its own (the same
+# planner, weights and budget on an assembly of just that block's parts)
+# instead of taking it apart in the flat sequence's order, which was chosen
+# with the other side still attached. Off: the flat order restricted to the
+# block. The evaluation turns it on for its trained+split-replan run.
+subassembly_replan_blocks = False
 
 # Manual page framing per subassembly side: outline colour for pages whose step
 # belongs to the S block and the R block. Nested blocks get one ring per level,

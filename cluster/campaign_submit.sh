@@ -95,7 +95,8 @@ submit() {  # submit NAME SUMMARY_ONLY [sbatch args...] -> job id
     local name="$1" summary_only="$2"
     shift 2
     env PHASE=eval RUN_NAME="${RUN_NAME}" IDS="${IDS}" ASSEMBLY_SUBDIR="${ASSEMBLY_SUBDIR}" \
-        EVAL_SPLIT=1 EVAL_RANDOM="${N_SEEDS}" EVAL_LABEL=campaign EVAL_NO_WAIT=1 \
+        EVAL_SPLIT=1 EVAL_SPLIT_REPLAN="${SPLIT_REPLAN:-0}" EVAL_RANDOM="${N_SEEDS}" \
+        EVAL_LABEL=campaign EVAL_NO_WAIT=1 \
         EVAL_SUMMARY_ONLY="${summary_only}" EVAL_RUN_TIMEOUT="${RUN_TIMEOUT}" \
         sbatch --parsable --job-name="hw_${name}_${RUN_NAME}" --mem-per-cpu="${MEM_PER_CPU}" \
         "$@" "${SBATCH_SCRIPT}"

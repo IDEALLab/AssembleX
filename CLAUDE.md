@@ -293,6 +293,20 @@ persisted, so a failure anywhere in it leaves the run exactly as it was.
    `stats['split_steps']` (flattened, including the `join` entries), and
    `stats['split_sequence']`.
 
+A block's removal order is by default the flat sequence's order restricted to
+the block -- chosen with the other side still attached. With
+`settings.subassembly_replan_blocks` (default off) every leaf block of at
+least 3 parts is planned again on its own (`_replan_split_leaves`): the same
+planner, weights and budget run on an assembly directory holding only that
+block's meshes (`_block_assembly_dir`, under `<log>/subassembly_blocks/<block>/`),
+and its selected sequence becomes the block's order; a block whose re-plan
+fails keeps the inherited order. Prefixes keep theirs (they come off a body
+that still holds the sub-blocks they free). A changed order is no tree path,
+so `split_sequence_source` becomes `'derived'`. `stats['subassembly_replan']`
+lists every block (inherited / re-planned order, changed); the subassembly
+timing then times the new orders. The setting is part of a divide run's
+fingerprint only when on.
+
 A `join` step — R separating from S as one rigid body — is **not a tree edge**,
 so it has no `Step` and no per-step GIF. It lives only in `split_steps`, with
 the verified world-axis separation direction attached as metadata, and the
@@ -769,6 +783,9 @@ run: `trained+split-par` (its parallel time) and `trained+divide` (its flat
 sequence, timed without the split). All
 are compared with the other three, and the summary reports on how many
 assemblies the plan was used; `trained+split-2w` is its two-worker time.
+`--eval-split-replan` adds `trained+split-replan` (and its `-2w` time): the
+subassembly run with `subassembly_replan_blocks` on, planned after
+trained+split, whose search it replays (campaign: `SPLIT_REPLAN=1`).
 `--eval-random N` adds `random` (`dfa-random`, seeds 0..N-1, per assembly the
 geometric mean of its complete seeds; the summary lists every seed),
 `--eval-reference-first` adds `reference-first` (reference weights,

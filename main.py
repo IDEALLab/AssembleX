@@ -288,6 +288,13 @@ if __name__ == "__main__":
         "as the plan is carried out, and compare it with the other planners.",
     )
     parser.add_argument(
+        "--eval-split-replan",
+        action="store_true",
+        help="data_heuristic_weights_eval: also plan the subassembly run with every "
+        "block of its plan re-planned on its own (settings.subassembly_replan_blocks); "
+        "implies --eval-split.",
+    )
+    parser.add_argument(
         "--optuna-timeout",
         type=float,
         default=None,
