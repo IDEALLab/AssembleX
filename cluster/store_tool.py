@@ -27,6 +27,14 @@
         again through the store's candidate-check cache, next to the flat
         sequence's cost and both timings. Needs the container (physics
         imports); a cache miss is simulated on --num-proc workers.
+    python cluster/store_tool.py split-2w-components [--out <csv>]
+        Every stored subassembly run whose plan was carried out: the timing
+        components of its two-worker time (prefix and join, then the slower
+        of S and R, nested splits sequential, as parallel_makespan(workers=2)),
+        from its timing_overview_split.json and split_plan. The first step of
+        an R half taken apart in parallel travels from the join, so its half
+        time differs from the sum of its steps; the difference is base
+        travel. Standard library only, so it runs on a login node.
     python cluster/store_tool.py repick <run dir> [--tolerance 0.15] [--out <json>]
         Pick a multi-objective run's weights again from its history.json, e.g.
         with another pareto_tolerance (weight_trainer.repick_run); writes
@@ -207,9 +215,90 @@ def split_cost(store, out, num_proc):
     print(f'{len(rows)} timed subassembly plans, {sum(not r.get("error") for r in rows)} scored -> {out}')
 
 
+SPLIT_2W_COLUMNS = ('id', 'n_parts', 'record', 'weights_key', 'replan', 'total_2w_s',
+                    'step_disassembly_s', 'transitions_s', 'base_travel_s', 'reorientation_s',
+                    'hold_s', 'critical_half', 'check_s', 'error')
+_COMPONENTS = ('step_disassembly_s', 'transitions_s', 'base_travel_s', 'reorientation_s', 'hold_s')
+
+
+def _plan_step_blocks(plan):
+    """The block path of every step of `plan`, in the order the split timing
+    walks it (split_timing._plan_walk): a split block's prefix removals and
+    its join, then S, then R; a leaf's removals but its last part."""
+    out = []
+
+    def walk(block):
+        path = list(block['path'])
+        if block['kind'] == 'split':
+            out.extend([path] * len(block['prefix']))
+            out.append(path)  # the join
+            walk(block['S'])
+            walk(block['R'])
+        else:
+            out.extend([path] * max(len(block['sequence']) - 1, 0))
+
+    walk(plan)
+    return out
+
+
+def split_2w_components(store, out):
+    rows = []
+    for path in sorted(glob.glob(os.path.join(store, 'runs', '*', '*.json'))):
+        if path.endswith(('assembly.json', '.weights.json')):
+            continue
+        try:
+            with open(path) as f:
+                rec = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        fp = rec.get('fingerprint') or {}
+        if fp.get('seq_optimizer') != 'divide' or rec.get('split') != 'used':
+            continue
+        row = {'id': rec.get('id'), 'n_parts': rec.get('n_parts'),
+               'record': os.path.relpath(path, store),
+               'weights_key': hashlib.sha1(json.dumps(fp.get('weights'), sort_keys=True).encode()).hexdigest()[:8],
+               'replan': bool((fp.get('settings') or {}).get('subassembly_replan_blocks'))}
+        try:
+            log = os.path.join(path[:-len('.json')] + '_run', 'log')
+            with open(os.path.join(log, 'stats.json')) as f:
+                plan = json.load(f)['split_plan']
+            with open(os.path.join(log, 'timing_overview_split.json')) as f:
+                timing = json.load(f)
+            steps = timing['per_step']
+            blocks = _plan_step_blocks(plan)
+            if len(blocks) != len(steps):
+                raise ValueError(f'{len(steps)} timed steps, {len(blocks)} in the plan')
+            halves = (timing.get('parallel_2') or {}).get('per_block_s') or {}
+            if 'S' not in halves or 'R' not in halves:
+                raise ValueError('no two-worker timing (timed before parallel_2 existed)')
+            half = max(('S', 'R'), key=lambda h: float(halves.get(h, 0.0)))
+            chosen = [st for st, b in zip(steps, blocks) if not b or b[0] == half]
+            comps = {c: sum(float(st.get(c) or 0.0) for st in chosen) for c in _COMPONENTS}
+            # Travel from the join instead of from where S ended (R half only).
+            in_half = sum(float(st['total_s']) for st, b in zip(steps, blocks) if b and b[0] == half)
+            comps['base_travel_s'] += float(halves[half]) - in_half
+            total = float(timing['parallel_2']['total_s'])
+            row.update(comps, total_2w_s=total, critical_half=half,
+                       check_s=sum(comps.values()) - total)
+        except Exception as e:
+            row['error'] = f'{type(e).__name__}: {e}'[:300]
+        rows.append(row)
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    with open(out, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=SPLIT_2W_COLUMNS)
+        w.writeheader()
+        for row in rows:
+            w.writerow({k: row.get(k) for k in SPLIT_2W_COLUMNS})
+    good = [r for r in rows if not r.get('error')]
+    worst = max((abs(r['check_s']) for r in good), default=0.0)
+    print(f'{len(rows)} carried-out subassembly plans, {len(good)} broken down '
+          f'(largest mismatch to the stored two-worker time {worst:.2g} s) -> {out}')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('command', choices=('import', 'select', 'report', 'split-features', 'repick', 'split-cost'))
+    parser.add_argument('command', choices=('import', 'select', 'report', 'split-features', 'repick', 'split-cost',
+                                            'split-2w-components'))
     parser.add_argument('run_dirs', nargs='*')
     parser.add_argument('--store', default=None)
     parser.add_argument('--dataset-dir', default=os.path.join('assets', 'data', 'asap'))
@@ -221,6 +310,11 @@ def main():
                         help='repick: pareto_tolerance (default: settings.heuristic_training)')
     args = parser.parse_args()
     os.chdir(ROOT)
+    if args.command == 'split-2w-components':
+        split_2w_components(args.store or os.path.join('assets', 'optuna_store'),
+                            args.out if '--out' in sys.argv
+                            else os.path.join('assets', 'optuna_runs', 'split_2w_components.csv'))
+        return
     if args.command == 'split-features':
         split_features(args.store or os.path.join('assets', 'optuna_store'), args.out)
         return
